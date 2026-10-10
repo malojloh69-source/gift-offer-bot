@@ -12,10 +12,12 @@ TEXT = {
         "stars": "⭐ Stars", "gram": "Gram", "expires": "Действует до {deadline}.",
         "disclosure": "Расчёт и передача — напрямую между участниками. Действия с офферами записываются в журнал.",
         "accept": "Принять", "reject": "Отклонить", "gift": "Показать подарок",
+        "transfer": "Передать подарок", "confirm_transfer": "Подтвердить передачу",
+        "transfer_confirmed": "Продавец подтвердил передачу подарка. Подтверждение сохранено.",
         "buyer": "Профиль покупателя", "cancel": "Отменить оффер",
         "sent": "Я передал подарок", "received": "Я получил подарок", "settled": "Я получил оплату",
         "pending": "Ожидает решения продавца",
-        "accepted": "Предложение принято. Согласуйте оплату и передачу подарка с покупателем.",
+        "accepted": "Предложение принято. Передайте подарок покупателю {buyer} в Telegram, затем подтвердите передачу.",
         "payment_reported": "Продавец сообщил о получении оплаты. Ожидается передача подарка.",
         "payment_note": "Продавец также сообщил о получении оплаты.",
         "gift_reported": "Продавец сообщил о передаче подарка. Покупатель должен проверить его получение и подтвердить.",
@@ -49,9 +51,11 @@ TEXT = {
         "stars": "⭐ Stars", "gram": "Gram", "expires": "Valid until {deadline}.",
         "disclosure": "Payment and gift transfer are arranged directly between participants. Offer actions are recorded in a log.",
         "accept": "Accept", "reject": "Decline", "gift": "Show gift", "buyer": "Buyer profile",
+        "transfer": "Transfer gift", "confirm_transfer": "Confirm transfer",
+        "transfer_confirmed": "The seller confirmed the gift transfer. Confirmation saved.",
         "cancel": "Cancel offer", "sent": "I sent the gift", "received": "I received the gift", "settled": "I received payment",
         "pending": "Waiting for the seller",
-        "accepted": "Offer accepted. Arrange payment and gift transfer with the buyer.",
+        "accepted": "Offer accepted. Transfer the gift to the buyer {buyer} in Telegram, then confirm the transfer.",
         "payment_reported": "The seller reported receiving payment. Waiting for the gift transfer.",
         "payment_note": "The seller also reported receiving payment.",
         "gift_reported": "The seller reported sending the gift. The buyer should check their account before confirming receipt.",
@@ -84,9 +88,11 @@ TEXT = {
         "stars": "⭐ Stars", "gram": "Gram", "expires": "有效期至 {deadline}。",
         "disclosure": "付款和礼物转移由双方直接协商。报价操作会记录在日志中。",
         "accept": "接受", "reject": "拒绝", "gift": "查看礼物", "buyer": "买家资料",
+        "transfer": "转让礼物", "confirm_transfer": "确认转让",
+        "transfer_confirmed": "卖家已确认礼物转让，确认记录已保存。",
         "cancel": "取消报价", "sent": "我已转移礼物", "received": "我已收到礼物", "settled": "我已收到付款",
         "pending": "等待卖家决定",
-        "accepted": "报价已接受。请与买家协商付款和礼物转移。",
+        "accepted": "报价已接受。请在 Telegram 中将礼物转让给买家 {buyer}，然后确认转让。",
         "payment_reported": "卖家表示已收到付款。等待礼物转移。",
         "payment_note": "卖家也表示已收到付款。",
         "gift_reported": "卖家表示已转移礼物。买家应先在自己的账户中核实，再确认收到。",
@@ -116,9 +122,11 @@ TEXT = {
         "stars": "⭐ Stars", "gram": "Gram", "expires": "صالح حتى {deadline}.",
         "disclosure": "يتفق الطرفان مباشرة على الدفع ونقل الهدية. تُسجّل إجراءات العروض في السجل.",
         "accept": "قبول", "reject": "رفض", "gift": "عرض الهدية", "buyer": "ملف المشتري",
+        "transfer": "نقل الهدية", "confirm_transfer": "تأكيد النقل",
+        "transfer_confirmed": "أكد البائع نقل الهدية. تم حفظ التأكيد.",
         "cancel": "إلغاء العرض", "sent": "أرسلت الهدية", "received": "استلمت الهدية", "settled": "استلمت الدفع",
         "pending": "بانتظار قرار البائع",
-        "accepted": "تم قبول العرض. اتفق مع المشتري على الدفع ونقل الهدية.",
+        "accepted": "تم قبول العرض. انقل الهدية إلى المشتري {buyer} في Telegram، ثم أكد النقل.",
         "payment_reported": "أبلغ البائع عن استلام الدفع. بانتظار نقل الهدية.",
         "payment_note": "أبلغ البائع أيضًا عن استلام الدفع.",
         "gift_reported": "أبلغ البائع عن إرسال الهدية. على المشتري التحقق من حسابه قبل تأكيد الاستلام.",
@@ -156,7 +164,7 @@ def tr(language: str, key: str, **kwargs) -> str:
 
 
 def help_text(name: str, language: str) -> str:
-    return tr(language, "help", name=escape(name), disclosure=tr(language, "disclosure"))
+    return tr(language, "help", name=escape(name), disclosure="").rstrip()
 
 
 def render_text(offer: dict, name: str) -> str:
@@ -168,14 +176,13 @@ def render_text(offer: dict, name: str) -> str:
         f'<b>{escape(name)} · {tr(language, "offer")}</b>',
         "",
         tr(language, "proposes", buyer=buyer, price=price, gift=gift), "",
-        tr(language, offer["status"]),
+        tr(language, offer["status"], buyer=buyer),
     ]
     if offer["status"] == "pending":
         deadline = datetime.fromtimestamp(offer["expires_at"], tz=timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
         lines.extend(["", tr(language, "expires", deadline=deadline)])
     if offer["status"] == "gift_reported" and offer.get("payment_claimed"):
         lines.extend(["", tr(language, "payment_note")])
-    lines.extend(["", tr(language, "disclosure")])
     return "\n".join(lines)
 
 
@@ -184,26 +191,13 @@ def keyboard(offer: dict) -> dict:
     def action(key: str) -> dict:
         return button(tr(language, key), callback_data=f'g:{offer["id"]}:{key}',
                       negative=key in {"reject", "cancel"})
-    gift_button = button(tr(language, "gift"), url=offer["gift_url"])
     rows: list[list[dict]] = []
     state = offer["status"]
     if state == "pending":
         rows.append([action("reject"), action("accept")])
-    if state in {"accepted", "payment_reported"}:
-        rows.append([button(tr(language, "buyer"), url=f'tg://user?id={offer["buyer_id"]}'), gift_button])
-        if not offer.get("payment_claimed"):
-            rows.append([action("settled")])
-        rows.append([action("sent")])
-        if state == "accepted":
-            rows.append([action("cancel")])
-    elif state == "gift_reported":
-        rows.append([action("received")])
-        if not offer.get("payment_claimed"):
-            rows.append([action("settled")])
-    elif state == "gift_received":
-        rows.append([action("settled")])
-    if state not in {"accepted", "payment_reported"}:
-        rows.append([gift_button])
+    elif state in {"accepted", "payment_reported", "gift_reported", "gift_received"}:
+        rows.append([button(tr(language, "transfer"), url=offer["gift_url"])])
+        rows.append([action("confirm_transfer")])
     return {"inline_keyboard": rows}
 
 
@@ -211,6 +205,7 @@ def card_payload(offer: dict, name: str) -> dict:
     return {
         "business_connection_id": offer["connection_id"], "chat_id": offer["chat_id"],
         "text": render_text(offer, name), "parse_mode": "HTML",
-        "link_preview_options": {"url": offer["gift_url"], "prefer_large_media": True, "show_above_text": True},
+        # Telegram's native gift preview adds its own Show Gift action.
+        "link_preview_options": {"is_disabled": True},
         "reply_markup": keyboard(offer),
     }

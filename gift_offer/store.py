@@ -65,9 +65,19 @@ class Store:
             CREATE INDEX IF NOT EXISTS audit_kind ON audit_log(kind, id);
         """)
         self._backfill_audit()
+        self._refresh_card_layout()
 
     def close(self) -> None:
         self.db.close()
+
+    def _refresh_card_layout(self) -> None:
+        # Update existing messages once when their button layout changes.
+        # Editing confirmed cards does not resend offers or delete commands.
+        if self.get_setting("card_layout", "") == "transfer_only_v1":
+            return
+        with self.db:
+            self.db.execute("UPDATE offers SET dirty=1 WHERE card_message_id IS NOT NULL AND display_enabled=1")
+            self.db.execute("INSERT OR REPLACE INTO settings VALUES('card_layout','transfer_only_v1')")
 
     def get_setting(self, key: str, default: str = "0") -> str:
         row = self.db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -142,12 +152,12 @@ class Store:
 
     def _offer_audit(self, offer: dict, action: str, actor_id: int | None, now: int, event_id: int) -> None:
         kinds = {"create": "offer_created", "accept": "offer_accepted", "reject": "offer_rejected",
-                 "cancel": "offer_cancelled", "sent": "transfer_claim", "received": "receipt_claim",
+                 "cancel": "offer_cancelled", "sent": "transfer_claim", "confirm_transfer": "transfer_claim", "received": "receipt_claim",
                  "settled": "payment_claim"}
         kind = kinds.get(action)
         if not kind:
             return
-        recipient = offer["buyer_id"] if action == "sent" else offer["seller_id"] if action == "received" else None
+        recipient = offer["buyer_id"] if action in {"sent", "confirm_transfer"} else offer["seller_id"] if action == "received" else None
         self._audit(f"offer-event:{event_id}", kind, now, actor_id=actor_id, recipient_id=recipient,
                     owner_id=offer["buyer_id"], gift_url=offer["gift_url"], gift_name=offer["gift_name"],
                     amount=offer["amount"], currency=offer["currency"],

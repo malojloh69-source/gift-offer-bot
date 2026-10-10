@@ -16,7 +16,7 @@ from .views import card_payload, help_text, language_for, render_text, tr
 
 
 log = logging.getLogger(__name__)
-CALLBACK = re.compile(r"g:([a-f0-9]{16}):(accept|reject|cancel|sent|received|settled)")
+CALLBACK = re.compile(r"g:([a-f0-9]{16}):(accept|reject|confirm_transfer|cancel|sent|received|settled)")
 
 
 def can_reply(connection: dict) -> bool:

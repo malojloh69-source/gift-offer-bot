@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 
 
 LANGUAGES = ("ru", "en", "zh", "ar")
-TERMINAL = frozenset({"completed", "rejected", "cancelled", "expired", "delivery_failed"})
+TERMINAL = frozenset({"completed", "transfer_confirmed", "rejected", "cancelled", "expired", "delivery_failed"})
 
 
 class OfferError(ValueError):
@@ -68,6 +68,7 @@ def parse_buy(text: str, default_language: str = "ru") -> OfferSpec:
 TRANSITIONS = {
     "accept": ("seller", {"pending"}, "accepted"),
     "reject": ("seller", {"pending"}, "rejected"),
+    "confirm_transfer": ("seller", {"accepted", "payment_reported", "gift_reported", "gift_received"}, "transfer_confirmed"),
     "cancel": ("buyer", {"pending", "accepted"}, "cancelled"),
     "sent": ("seller", {"accepted", "payment_reported"}, "gift_reported"),
     "received": ("buyer", {"gift_reported"}, "gift_received"),

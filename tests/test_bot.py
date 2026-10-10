@@ -148,6 +148,79 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("по их заявлениям", render_text(offer, self.config.name))
         actions = [r[0] for r in self.store.db.execute("SELECT action FROM events ORDER BY id")]
         self.assertEqual(actions, ["create", "accept", "settled", "sent", "received"])
+
+    async def test_minimal_transfer_flow_closes_without_claiming_payment(self):
+        offer = await self.create_offer()
+        pending = keyboard(offer)["inline_keyboard"]
+        self.assertEqual([[b["text"] for b in row] for row in pending], [["Отклонить", "Принять"]])
+        offer = await self.act(offer, "accept", SELLER)
+        accepted = keyboard(offer)["inline_keyboard"]
+        self.assertEqual([[b["text"] for b in row] for row in accepted],
+                         [["Передать подарок"], ["Подтвердить передачу"]])
+        self.assertEqual(accepted[0][0]["url"], offer["gift_url"])
+        self.assertEqual(accepted[1][0]["callback_data"], f'g:{offer["id"]}:confirm_transfer')
+        self.assertEqual(offer["status"], "accepted")  # Opening a URL records no transfer.
+        offer = await self.act(offer, "confirm_transfer", SELLER)
+        self.assertEqual(offer["status"], "transfer_confirmed")
+        self.assertEqual(offer["payment_claimed"], 0)
+        self.assertEqual(keyboard(offer)["inline_keyboard"], [])
+        transfers = self.store.audit_page("transfers")
+        self.assertEqual(len(transfers), 1)
+        self.assertEqual((transfers[0]["actor_id"], transfers[0]["recipient_id"], transfers[0]["evidence"]),
+                         (SELLER, BUYER, "user_statement"))
+        text = render_text(offer, self.config.name)
+        self.assertIn("Продавец подтвердил передачу", text)
+        self.assertNotIn("получении подарка и оплаты", text)
+
+    async def test_transfer_confirmation_requires_acceptance_and_the_seller_and_is_idempotent(self):
+        offer = await self.create_offer()
+        offer = await self.act(offer, "confirm_transfer", SELLER)
+        self.assertEqual(offer["status"], "pending")
+        offer = await self.act(offer, "accept", SELLER)
+        for actor in (BUYER, 333):
+            offer = await self.act(offer, "confirm_transfer", actor)
+            self.assertEqual(offer["status"], "accepted")
+        offer = await self.act(offer, "confirm_transfer", SELLER)
+        for action, actor in [("confirm_transfer", SELLER), ("sent", SELLER), ("settled", SELLER),
+                              ("received", BUYER), ("cancel", BUYER), ("reject", SELLER)]:
+            offer = await self.act(offer, action, actor)
+            self.assertEqual(offer["status"], "transfer_confirmed")
+            self.assertEqual(offer["payment_claimed"], 0)
+        self.assertEqual(len(self.store.audit_page("transfers")), 1)
+        actions = [row[0] for row in self.store.db.execute("SELECT action FROM events ORDER BY id")]
+        self.assertEqual(actions, ["create", "accept", "confirm_transfer"])
+
+    async def test_upgrade_refreshes_existing_card_without_resending_and_only_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "offers.sqlite3")
+            previous = Store(path)
+            offer = previous.create(parse_buy(".buy https://t.me/nft/Gift-1 500 stars"), CONNECTION,
+                                    {"chat": {"id": SELLER}, "message_id": 10}, self.now, 21600)
+            previous.attach_card(offer["id"], 101)
+            previous.transition(offer["id"], "accept", SELLER, self.now)
+            previous.mark_clean(offer["id"], "accepted")
+            previous.set_setting("card_layout", "old")
+            previous.close()
+            upgraded = Store(path)
+            try:
+                self.assertEqual(upgraded.offer(offer["id"])["dirty"], 1)
+                service = Service(self.config, upgraded, self.api, BOT, clock=lambda: self.now)
+                await service.tick()
+                edits = [params for method, params in self.api.calls if method == "editMessageText"]
+                self.assertEqual(len(edits), 1)
+                self.assertEqual(edits[0]["message_id"], 101)
+                self.assertEqual([[b["text"] for b in row] for row in edits[0]["reply_markup"]["inline_keyboard"]],
+                                 [["Передать подарок"], ["Подтвердить передачу"]])
+                self.assertEqual(edits[0]["link_preview_options"], {"is_disabled": True})
+                self.assertFalse(any(method == "sendMessage" for method, _ in self.api.calls))
+                self.assertEqual(upgraded.offer(offer["id"])["dirty"], 0)
+            finally:
+                upgraded.close()
+            reopened = Store(path)
+            try:
+                self.assertEqual(reopened.offer(offer["id"])["dirty"], 0)
+            finally:
+                reopened.close()
         self.assertFalse(any("transfer" in method.lower() or "invoice" in method.lower() for method, _ in self.api.calls))
 
     async def test_full_flow_payment_after_gift(self):
@@ -371,10 +444,10 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("gift_offer.telegram.urlopen", side_effect=http):
             offer = await self.create_offer()
-            for action, actor in [("accept", SELLER), ("settled", SELLER),
-                                  ("sent", SELLER), ("received", BUYER)]:
+            for action, actor in [("accept", SELLER), ("confirm_transfer", SELLER)]:
                 offer = await self.act(offer, action, actor)
-            self.assertEqual(offer["status"], "completed")
+            self.assertEqual(offer["status"], "transfer_confirmed")
+            self.assertEqual(offer["payment_claimed"], 0)
             gram = await self.create_offer(".buy https://t.me/nft/DurovsCap-1234 10 gram en", message_id=11)
             gram = await self.act(gram, "reject", SELLER)
             self.assertEqual(gram["status"], "rejected")
@@ -390,7 +463,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(not has_custom_emoji(params) for params in edits))
         self.assertTrue(self.store.is_admin(BUYER))
         self.assertEqual(self.store.audit_stats()["visit"], 1)
-        self.assertEqual(len(self.store.audit_page("transfers")), 2)
+        self.assertEqual(len(self.store.audit_page("transfers")), 1)
 
     async def test_invalid_or_incoming_command_is_never_deleted(self):
         await self.service.handle(self.message(".buy broken"))
@@ -558,19 +631,31 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         for language in TEXT:
             self.assertEqual(set(TEXT[language]), keys)
             offer["language"] = language
-            for status in ("pending", "accepted", "payment_reported", "gift_reported", "gift_received", "completed", "rejected", "expired"):
+            for status in ("pending", "accepted", "payment_reported", "gift_reported", "gift_received",
+                           "transfer_confirmed", "completed", "rejected", "cancelled", "expired"):
                 offer["status"] = status
                 payload = card_payload(offer, self.config.name)
                 self.assertLessEqual(len(payload["text"]), 4096)
-                self.assertTrue(payload["link_preview_options"]["show_above_text"])
+                self.assertEqual(payload["link_preview_options"], {"is_disabled": True})
                 for row in payload["reply_markup"]["inline_keyboard"]:
                     for button in row:
                         self.assertLessEqual(len(button.get("callback_data", "").encode()), 64)
                         action = button.get("callback_data", "").rsplit(":", 1)[-1]
                         expected_icon = NEGATIVE_EMOJI_ID if action in {"reject", "cancel"} else POSITIVE_EMOJI_ID
                         self.assertEqual(button["icon_custom_emoji_id"], expected_icon)
-                self.assertIn(TEXT[language]["disclosure"], payload["text"])
+                self.assertNotIn(TEXT[language]["disclosure"], payload["text"])
+                rows = payload["reply_markup"]["inline_keyboard"]
+                if status == "pending":
+                    self.assertEqual([[b["callback_data"].rsplit(":", 1)[-1] for b in row] for row in rows],
+                                     [["reject", "accept"]])
+                elif status in {"accepted", "payment_reported", "gift_reported", "gift_received"}:
+                    self.assertEqual(len(rows), 2)
+                    self.assertEqual(rows[0][0]["url"], offer["gift_url"])
+                    self.assertEqual(rows[1][0]["callback_data"].rsplit(":", 1)[-1], "confirm_transfer")
+                else:
+                    self.assertEqual(rows, [])
             self.assertLessEqual(len(help_text(self.config.name, language)), 4096)
+            self.assertNotIn(TEXT[language]["disclosure"], help_text(self.config.name, language))
 
     async def test_html_names_cannot_inject_recipient_links(self):
         self.api.connection["user"]["first_name"] = '<a href="https://evil.test">Fake</a>'
