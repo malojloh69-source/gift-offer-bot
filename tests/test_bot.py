@@ -21,7 +21,7 @@ from gift_offer.domain import OfferError, parse_buy
 from gift_offer.service import Service
 from gift_offer.store import Store
 from gift_offer.telegram import Telegram, TelegramError, TransportError
-from gift_offer.views import TEXT, card_payload, help_text, keyboard, render_text
+from gift_offer.views import TEXT, card_payload, help_text, keyboard, render_text, transfer_url
 from gift_offer import admin
 from gift_offer.ui import (GRAM_EMOJI_ID, NEGATIVE_EMOJI_ID, POSITIVE_EMOJI_ID,
                            STARS_EMOJI_ID, has_custom_emoji, without_custom_emoji)
@@ -157,7 +157,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         accepted = keyboard(offer)["inline_keyboard"]
         self.assertEqual([[b["text"] for b in row] for row in accepted],
                          [["Передать подарок"], ["Подтвердить передачу"]])
-        self.assertEqual(accepted[0][0]["url"], offer["gift_url"])
+        self.assertEqual(accepted[0][0]["url"], "tg://send_gift?to=real_buyer")
         self.assertEqual(accepted[1][0]["callback_data"], f'g:{offer["id"]}:confirm_transfer')
         self.assertEqual(offer["status"], "accepted")  # Opening a URL records no transfer.
         offer = await self.act(offer, "confirm_transfer", SELLER)
@@ -211,7 +211,9 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(edits[0]["message_id"], 101)
                 self.assertEqual([[b["text"] for b in row] for row in edits[0]["reply_markup"]["inline_keyboard"]],
                                  [["Передать подарок"], ["Подтвердить передачу"]])
-                self.assertEqual(edits[0]["link_preview_options"], {"is_disabled": True})
+                self.assertFalse(edits[0]["link_preview_options"]["is_disabled"])
+                self.assertEqual(edits[0]["link_preview_options"]["url"], offer["gift_url"])
+                self.assertTrue(edits[0]["link_preview_options"]["show_above_text"])
                 self.assertFalse(any(method == "sendMessage" for method, _ in self.api.calls))
                 self.assertEqual(upgraded.offer(offer["id"])["dirty"], 0)
             finally:
@@ -636,7 +638,10 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 offer["status"] = status
                 payload = card_payload(offer, self.config.name)
                 self.assertLessEqual(len(payload["text"]), 4096)
-                self.assertEqual(payload["link_preview_options"], {"is_disabled": True})
+                self.assertFalse(payload["link_preview_options"]["is_disabled"])
+                self.assertEqual(payload["link_preview_options"]["url"], offer["gift_url"])
+                self.assertTrue(payload["link_preview_options"]["prefer_large_media"])
+                self.assertTrue(payload["link_preview_options"]["show_above_text"])
                 for row in payload["reply_markup"]["inline_keyboard"]:
                     for button in row:
                         self.assertLessEqual(len(button.get("callback_data", "").encode()), 64)
@@ -650,7 +655,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                                      [["reject", "accept"]])
                 elif status in {"accepted", "payment_reported", "gift_reported", "gift_received"}:
                     self.assertEqual(len(rows), 2)
-                    self.assertEqual(rows[0][0]["url"], offer["gift_url"])
+                    self.assertEqual(rows[0][0]["url"], "tg://send_gift?to=real_buyer")
                     self.assertEqual(rows[1][0]["callback_data"].rsplit(":", 1)[-1], "confirm_transfer")
                 else:
                     self.assertEqual(rows, [])
@@ -660,11 +665,60 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_html_names_cannot_inject_recipient_links(self):
         self.api.connection["user"]["first_name"] = '<a href="https://evil.test">Fake</a>'
         offer = await self.create_offer()
+        offer = await self.act(offer, "accept", SELLER)
         text = render_text(offer, "<unsafe>")
-        self.assertIn("&lt;unsafe&gt;", text)
         self.assertIn("&lt;a href=", text)
         self.assertIn(f'tg://user?id={BUYER}', text)
         self.assertNotIn('<a href="https://evil.test">', text)
+
+    async def test_offer_caption_uses_actual_price_gift_and_remaining_time(self):
+        offer = await self.create_offer()
+        text = render_text(offer, self.config.name, now=self.now)
+        self.assertTrue(text.startswith("Пользователь предлагает Вам\n<b>8900</b>"))
+        self.assertIn("Звёзд за подарок", text)
+        self.assertIn(offer["gift_name"], text)
+        self.assertIn("Предложение действует ещё 6 ч. 0 мин..", text)
+        self.assertNotIn("UTC", text)
+        later = render_text(offer, self.config.name, now=self.now + 3661)
+        self.assertIn("4 ч. 59 мин..", later)
+        short = {**offer, "expires_at": self.now + 50}
+        self.assertIn("0 ч. 1 мин..", render_text(short, self.config.name, now=self.now))
+        gram = await self.create_offer(".buy https://t.me/nft/DurovsCap-1234 10.5 gram", message_id=11)
+        gram_text = render_text(gram, self.config.name, now=self.now)
+        self.assertIn("<b>10.5</b>", gram_text)
+        self.assertIn("GRAM за подарок", gram_text)
+        self.assertNotIn("8900", gram_text)
+        self.assertIn(gram["gift_name"], gram_text)
+
+    async def test_countdown_edits_only_confirmed_card_once_per_minute_and_expires(self):
+        offer = await self.create_offer()
+        initial_sends = sum(method == "sendMessage" for method, _ in self.api.calls)
+        self.now += 61
+        await self.service.tick()
+        edits = [params for method, params in self.api.calls if method == "editMessageText"]
+        self.assertEqual(len(edits), 1)
+        self.assertEqual(edits[0]["message_id"], offer["card_message_id"])
+        self.assertNotEqual(edits[0]["message_id"], offer["source_message_id"])
+        self.assertIn("5 ч. 59 мин..", edits[0]["text"])
+        self.now += 10
+        await self.service.tick()
+        self.assertEqual(sum(method == "editMessageText" for method, _ in self.api.calls), 1)
+        self.assertEqual(sum(method == "sendMessage" for method, _ in self.api.calls), initial_sends)
+        self.now = offer["expires_at"]
+        await self.service.tick()
+        self.assertEqual(self.store.offer(offer["id"])["status"], "expired")
+        final = [params for method, params in self.api.calls if method == "editMessageText"][-1]
+        self.assertEqual(final["reply_markup"]["inline_keyboard"], [])
+        self.assertNotIn("действует ещё", final["text"])
+
+    async def test_transfer_link_is_bound_to_buyer_and_cannot_inject_another_recipient(self):
+        offer = await self.create_offer()
+        self.assertEqual(transfer_url({**offer, "buyer_username": "woutb"}), "tg://send_gift?to=woutb")
+        for username in ("", "real_buyer&to=attacker", "real_buyer?to=attacker", "../attacker", "@attacker"):
+            self.assertEqual(transfer_url({**offer, "buyer_username": username}), f"tg://send_gift?to={BUYER}")
+        self.assertEqual(self.store.audit_page("transfers"), [])
+        with self.assertRaises(ValueError):
+            transfer_url({**offer, "buyer_username": "", "buyer_id": -1})
 
     async def test_new_connected_owner_can_create_without_manual_configuration(self):
         self.api.connection["user"]["id"] = 333

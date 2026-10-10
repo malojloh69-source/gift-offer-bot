@@ -73,11 +73,11 @@ class Store:
     def _refresh_card_layout(self) -> None:
         # Update existing messages once when their button layout changes.
         # Editing confirmed cards does not resend offers or delete commands.
-        if self.get_setting("card_layout", "") == "transfer_only_v1":
+        if self.get_setting("card_layout", "") == "gift_preview_v2":
             return
         with self.db:
             self.db.execute("UPDATE offers SET dirty=1 WHERE card_message_id IS NOT NULL AND display_enabled=1")
-            self.db.execute("INSERT OR REPLACE INTO settings VALUES('card_layout','transfer_only_v1')")
+            self.db.execute("INSERT OR REPLACE INTO settings VALUES('card_layout','gift_preview_v2')")
 
     def get_setting(self, key: str, default: str = "0") -> str:
         row = self.db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -318,6 +318,15 @@ class Store:
             for row in rows:
                 self.db.execute("UPDATE offers SET status='expired',updated_at=?,dirty=1 WHERE id=?", (now, row[0]))
                 self.db.execute("INSERT INTO events(offer_id,action,at) VALUES(?,?,?)", (row[0], "expire", now))
+
+    def refresh_pending_countdowns(self, now: int) -> None:
+        minute = str(now // 60)
+        if self.get_setting("countdown_minute", "") == minute:
+            return
+        with self.db:
+            self.db.execute("UPDATE offers SET dirty=1 WHERE status='pending' AND expires_at>? "
+                            "AND card_message_id IS NOT NULL AND display_enabled=1", (now,))
+            self.db.execute("INSERT OR REPLACE INTO settings VALUES('countdown_minute',?)", (minute,))
 
     def dirty_offers(self) -> list[dict]:
         return [dict(row) for row in self.db.execute(

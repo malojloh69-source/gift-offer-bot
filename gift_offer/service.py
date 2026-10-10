@@ -189,7 +189,7 @@ class Service:
             return
         offer = self.store.create(spec, connection, message, now, self.config.offer_ttl)
         try:
-            result = await self.api.call("sendMessage", **card_payload(offer, self.config.name))
+            result = await self.api.call("sendMessage", **card_payload(offer, self.config.name, now=now))
             message_id = result.get("message_id") if isinstance(result, dict) else None
             if type(message_id) is not int or message_id <= 0:
                 raise TransportError("Telegram did not return a delivered message identifier")
@@ -268,7 +268,7 @@ class Service:
             except OfferError as exc:
                 await self.notify_owner(connection, tr(offer["language"], exc.code))
                 return
-        await self.notify_owner(connection, render_text(offer, self.config.name))
+        await self.notify_owner(connection, render_text(offer, self.config.name, now=now))
 
     async def callback(self, query: dict, now: int) -> None:
         user = query.get("from", {})
@@ -332,6 +332,7 @@ class Service:
         async with self.lock:
             now = int(self.clock())
             self.store.expire(now)
+            self.store.refresh_pending_countdowns(now)
             await self._flush(now)
             await self._cleanup_commands(now)
 
@@ -344,7 +345,7 @@ class Service:
                 if not can_reply(connection):
                     continue
                 await self.api.call("editMessageText", message_id=offer["card_message_id"],
-                                    **card_payload(offer, self.config.name))
+                                    **card_payload(offer, self.config.name, now=now))
             except TelegramError as exc:
                 if "message is not modified" in exc.description.lower():
                     self.store.mark_clean(offer["id"], offer["status"])

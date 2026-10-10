@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import re
+import time
 from html import escape
 
 from .ui import button, price_text
@@ -8,8 +9,8 @@ from .ui import button, price_text
 
 TEXT = {
     "ru": {
-        "offer": "Предложение", "proposes": "{buyer} предлагает <b>{price}</b> за подарок {gift}.",
-        "stars": "⭐ Stars", "gram": "Gram", "expires": "Действует до {deadline}.",
+        "offer": "Предложение", "proposes": "Пользователь предлагает Вам\n{price} за подарок {gift}.",
+        "stars": "Звёзд", "gram": "GRAM", "expires": "Предложение действует ещё {hours} ч. {minutes} мин..",
         "disclosure": "Расчёт и передача — напрямую между участниками. Действия с офферами записываются в журнал.",
         "accept": "Принять", "reject": "Отклонить", "gift": "Показать подарок",
         "transfer": "Передать подарок", "confirm_transfer": "Подтвердить передачу",
@@ -47,8 +48,8 @@ TEXT = {
         "done": "Сохранено.", "check_chat": "Карточка могла быть отправлена. Проверь чат перед повтором команды.",
     },
     "en": {
-        "offer": "Offer", "proposes": "{buyer} offers <b>{price}</b> for {gift}.",
-        "stars": "⭐ Stars", "gram": "Gram", "expires": "Valid until {deadline}.",
+        "offer": "Offer", "proposes": "A user offers you\n{price} for {gift}.",
+        "stars": "Stars", "gram": "Gram", "expires": "Offer valid for another {hours} h {minutes} min.",
         "disclosure": "Payment and gift transfer are arranged directly between participants. Offer actions are recorded in a log.",
         "accept": "Accept", "reject": "Decline", "gift": "Show gift", "buyer": "Buyer profile",
         "transfer": "Transfer gift", "confirm_transfer": "Confirm transfer",
@@ -84,8 +85,8 @@ TEXT = {
         "done": "Saved.", "check_chat": "The card may have been delivered. Check the chat before retrying.",
     },
     "zh": {
-        "offer": "报价", "proposes": "{buyer} 愿以 <b>{price}</b> 购买 {gift}。",
-        "stars": "⭐ Stars", "gram": "Gram", "expires": "有效期至 {deadline}。",
+        "offer": "报价", "proposes": "用户愿以\n{price} 购买您的礼物 {gift}。",
+        "stars": "Stars", "gram": "Gram", "expires": "报价剩余有效时间：{hours} 小时 {minutes} 分钟。",
         "disclosure": "付款和礼物转移由双方直接协商。报价操作会记录在日志中。",
         "accept": "接受", "reject": "拒绝", "gift": "查看礼物", "buyer": "买家资料",
         "transfer": "转让礼物", "confirm_transfer": "确认转让",
@@ -118,8 +119,8 @@ TEXT = {
         "check_chat": "卡片可能已发送。重新发送命令前请检查聊天。",
     },
     "ar": {
-        "offer": "عرض", "proposes": "يعرض {buyer} مبلغ <b>{price}</b> مقابل {gift}.",
-        "stars": "⭐ Stars", "gram": "Gram", "expires": "صالح حتى {deadline}.",
+        "offer": "عرض", "proposes": "يعرض عليك مستخدم\n{price} مقابل الهدية {gift}.",
+        "stars": "Stars", "gram": "Gram", "expires": "العرض صالح لمدة {hours} ساعة و{minutes} دقيقة أخرى.",
         "disclosure": "يتفق الطرفان مباشرة على الدفع ونقل الهدية. تُسجّل إجراءات العروض في السجل.",
         "accept": "قبول", "reject": "رفض", "gift": "عرض الهدية", "buyer": "ملف المشتري",
         "transfer": "نقل الهدية", "confirm_transfer": "تأكيد النقل",
@@ -167,20 +168,34 @@ def help_text(name: str, language: str) -> str:
     return tr(language, "help", name=escape(name), disclosure="").rstrip()
 
 
-def render_text(offer: dict, name: str) -> str:
+def remaining_minutes(offer: dict, now: int) -> int:
+    return (max(0, offer["expires_at"] - now) + 59) // 60
+
+
+def transfer_url(offer: dict) -> str:
+    # Route to the offer's actual buyer; never use a configurable third party.
+    username = str(offer.get("buyer_username", ""))
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,31}", username):
+        recipient = username
+    else:
+        buyer_id = offer["buyer_id"]
+        if type(buyer_id) is not int or buyer_id <= 0:
+            raise ValueError("The gift recipient must be the offer's buyer")
+        recipient = str(buyer_id)
+    return f"tg://send_gift?to={recipient}"
+
+
+def render_text(offer: dict, name: str, *, now: int | None = None) -> str:
     language = offer["language"]
     gift = f'<a href="{escape(offer["gift_url"], quote=True)}">{escape(offer["gift_name"])}</a>'
     buyer = f'<a href="tg://user?id={offer["buyer_id"]}">{escape(offer["buyer_name"])}</a>'
-    price = price_text(offer["amount"], offer["currency"])
-    lines = [
-        f'<b>{escape(name)} · {tr(language, "offer")}</b>',
-        "",
-        tr(language, "proposes", buyer=buyer, price=price, gift=gift), "",
-        tr(language, offer["status"], buyer=buyer),
-    ]
+    price = price_text(offer["amount"], offer["currency"], label=tr(language, offer["currency"]))
+    lines = [tr(language, "proposes", buyer=buyer, price=price, gift=gift)]
     if offer["status"] == "pending":
-        deadline = datetime.fromtimestamp(offer["expires_at"], tz=timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
-        lines.extend(["", tr(language, "expires", deadline=deadline)])
+        hours, minutes = divmod(remaining_minutes(offer, int(time.time()) if now is None else now), 60)
+        lines.extend(["", tr(language, "expires", hours=hours, minutes=minutes)])
+    else:
+        lines.extend(["", tr(language, offer["status"], buyer=buyer)])
     if offer["status"] == "gift_reported" and offer.get("payment_claimed"):
         lines.extend(["", tr(language, "payment_note")])
     return "\n".join(lines)
@@ -196,16 +211,16 @@ def keyboard(offer: dict) -> dict:
     if state == "pending":
         rows.append([action("reject"), action("accept")])
     elif state in {"accepted", "payment_reported", "gift_reported", "gift_received"}:
-        rows.append([button(tr(language, "transfer"), url=offer["gift_url"])])
+        rows.append([button(tr(language, "transfer"), url=transfer_url(offer))])
         rows.append([action("confirm_transfer")])
     return {"inline_keyboard": rows}
 
 
-def card_payload(offer: dict, name: str) -> dict:
+def card_payload(offer: dict, name: str, *, now: int | None = None) -> dict:
     return {
         "business_connection_id": offer["connection_id"], "chat_id": offer["chat_id"],
-        "text": render_text(offer, name), "parse_mode": "HTML",
-        # Telegram's native gift preview adds its own Show Gift action.
-        "link_preview_options": {"is_disabled": True},
+        "text": render_text(offer, name, now=now), "parse_mode": "HTML",
+        "link_preview_options": {"is_disabled": False, "url": offer["gift_url"],
+                                 "prefer_large_media": True, "show_above_text": True},
         "reply_markup": keyboard(offer),
     }

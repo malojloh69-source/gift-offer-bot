@@ -16,9 +16,9 @@ CURRENCY_EMOJI = {
 }
 
 
-def price_text(amount: str, currency: str) -> str:
-    emoji_id, fallback, label = CURRENCY_EMOJI[currency]
-    return f'{escape(amount)} <tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji> {label}'
+def price_text(amount: str, currency: str, *, label: str | None = None) -> str:
+    emoji_id, fallback, default_label = CURRENCY_EMOJI[currency]
+    return f'<b>{escape(amount)}</b> <tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji> {escape(label or default_label)}'
 
 
 def button(text: str, *, callback_data: str | None = None,
