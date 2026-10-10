@@ -66,6 +66,11 @@ class Service:
         except (TelegramError, TransportError) as exc:
             log.warning("Owner notification unavailable: %s", exc)
 
+    def peer_flood_details(self, language: str, connection_id: str, chat_id: int, now: int) -> str:
+        incoming = self.store.last_incoming(connection_id, chat_id)
+        key = "incoming_unknown" if not incoming else "incoming_recent" if now - incoming < 86400 else "incoming_old"
+        return tr(language, key)
+
     async def handle(self, update: dict) -> None:
         async with self.lock:
             now = int(self.clock())
@@ -132,6 +137,16 @@ class Service:
             log.warning("Private reply failed: %s", exc)
 
     async def business_message(self, message: dict, now: int) -> None:
+        # Observe genuine incoming updates even when they are not commands.
+        # Edited messages and callback clicks do not refresh the reply window.
+        sender, chat = message.get("from", {}), message.get("chat", {})
+        connection_id, at = message.get("business_connection_id"), message.get("date")
+        if (isinstance(connection_id, str) and connection_id and chat.get("type") == "private"
+                and type(chat.get("id")) is int and chat["id"] > 0
+                and sender.get("id") == chat["id"] and not sender.get("is_bot")
+                and not message.get("sender_business_bot") and not message.get("is_from_offline")
+                and type(at) is int and 0 < at <= now):
+            self.store.note_incoming(connection_id, chat["id"], at)
         text = message.get("text", "").strip()
         is_gift = message.get("unique_gift", {}).get("origin") == "transfer"
         if not is_gift and (not text or text.split()[0].lower() not in {".buy", ".help", ".status", ".cancel"}):
@@ -200,13 +215,19 @@ class Service:
             if ambiguous:
                 response = tr(spec.language, "check_chat")
             else:
-                key = "peer_flood" if "PEER_FLOOD" in exc.description.upper() else "delivery_failed"
+                key = "peer_flood" if exc.is_peer_flood else "delivery_failed"
+                if exc.is_peer_flood:
+                    self.store.pause_card_updates(connection_id, chat["id"])
                 cause = escape(exc.description.replace(self.config.token, "[BOT_TOKEN]")[:500])
                 response = tr(spec.language, key) + "\n\n" + tr(
                     spec.language, "delivery_cause", code=exc.code, cause=cause)
+                if exc.is_peer_flood:
+                    response += "\n\n" + self.peer_flood_details(
+                        spec.language, connection_id, chat["id"], int(self.clock()))
             await self.notify_owner(connection, response)
             return
         self.store.attach_card(offer["id"], message_id)
+        self.store.resume_card_updates(connection_id, chat["id"])
 
     async def _cleanup_commands(self, now: int) -> None:
         # Jobs exist only for new commands. A confirmed card is required;
@@ -318,6 +339,9 @@ class Service:
         if message["message_id"] != offer["card_message_id"]:
             await self.answer(query_id, tr(language, "wrong_card"), True)
             return
+        if not self.store.can_update_card(offer["connection_id"], offer["chat_id"], now):
+            await self.answer(query_id, tr(language, "card_updates_paused"), True)
+            return
         self.store.touch_user(user, now)
         try:
             self.store.transition(offer_id, action, user["id"], now)
@@ -337,8 +361,11 @@ class Service:
             await self._cleanup_commands(now)
 
     async def _flush(self, now: int) -> None:
-        for offer in self.store.dirty_offers():
+        for offer in self.store.dirty_offers(now):
             if self.retry_at.get(offer["id"], 0) > now:
+                continue
+            # Recheck because a preceding card in this batch may have paused the chat.
+            if not self.store.can_update_card(offer["connection_id"], offer["chat_id"], now):
                 continue
             try:
                 connection = await self.connection(offer["connection_id"])
@@ -347,7 +374,23 @@ class Service:
                 await self.api.call("editMessageText", message_id=offer["card_message_id"],
                                     **card_payload(offer, self.config.name, now=now))
             except TelegramError as exc:
-                if "message is not modified" in exc.description.lower():
+                if exc.is_peer_flood:
+                    self.store.pause_card_updates(offer["connection_id"], offer["chat_id"])
+                    log.warning("Card updates paused for chat %s on connection %s: %s",
+                                offer["chat_id"], offer["connection_id"], exc)
+                    connection = self.connections.get(offer["connection_id"])
+                    if connection:
+                        cause = escape(exc.description.replace(self.config.token, "[BOT_TOKEN]")[:500])
+                        response = tr(offer["language"], "card_peer_flood") + "\n\n" + tr(
+                            offer["language"], "delivery_cause", code=exc.code, cause=cause)
+                        response += "\n\n" + self.peer_flood_details(
+                            offer["language"], offer["connection_id"], offer["chat_id"], int(self.clock()))
+                        await self.notify_owner(connection, response)
+                elif exc.code == 429:
+                    self.store.defer_card_updates(offer["connection_id"], offer["chat_id"],
+                                                  int(self.clock()) + max(exc.retry_after, 60))
+                    log.info("Card updates deferred for the Telegram retry_after interval.")
+                elif "message is not modified" in exc.description.lower():
                     self.store.mark_clean(offer["id"], offer["status"])
                 elif "message to edit not found" in exc.description.lower():
                     self.store.hide_card(offer["connection_id"], offer["chat_id"], offer["card_message_id"], now)

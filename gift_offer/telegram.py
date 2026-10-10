@@ -20,6 +20,10 @@ class TelegramError(RuntimeError):
         self.description = description
         super().__init__(f"Telegram API {code}: {description}")
 
+    @property
+    def is_peer_flood(self) -> bool:
+        return "PEER_FLOOD" in self.description.upper()
+
 
 class TransportError(RuntimeError):
     """A failed network request may still have reached Telegram."""
@@ -95,6 +99,9 @@ class Telegram:
             try:
                 return await asyncio.to_thread(self._call, method, params, timeout)
             except TelegramError as exc:
+                # Never switch payloads or methods to retry an explicit anti-spam refusal.
+                if exc.is_peer_flood:
+                    raise
                 description = exc.description.lower().replace("_", " ")
                 if (message_method and exc.code in {400, 403} and has_custom_emoji(params)
                         and any(marker in description for marker in

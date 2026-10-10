@@ -611,6 +611,222 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.service.tick()
         self.assertEqual(self.store.offer(offer["id"])["dirty"], 0)
 
+    async def test_incoming_messages_are_observed_without_replying_or_logging_content(self):
+        incoming = self.message("Private text not for the audit log", message_id=20)
+        incoming["business_message"]["from"]["id"] = SELLER
+        incoming["business_message"]["date"] = self.now - 10
+        await self.service.handle(incoming)
+        self.assertEqual(self.store.last_incoming(CONNECTION["id"], SELLER), self.now - 10)
+        self.assertFalse(self.api.calls)
+        self.assertEqual(self.store.audit_page(), [])
+        incoming["business_message"]["date"] = self.now - 50
+        await self.service.handle(incoming)
+        self.assertEqual(self.store.last_incoming(CONNECTION["id"], SELLER), self.now - 10)
+
+    async def test_outgoing_edited_bot_and_invalid_messages_do_not_refresh_incoming_window(self):
+        ordinary = self.message("hello")
+        await self.service.handle(ordinary)
+        incoming = copy.deepcopy(ordinary["business_message"])
+        incoming["from"]["id"] = SELLER
+        await self.service.handle({"edited_business_message": incoming})
+        for extra in [{"from": {"id": SELLER, "is_bot": True}},
+                      {"sender_business_bot": {"id": BOT}}, {"is_from_offline": True},
+                      {"date": self.now + 1}, {"date": True}, {"date": 0}]:
+            changed = copy.deepcopy(incoming)
+            changed.update(extra)
+            await self.service.handle({"business_message": changed})
+        self.assertEqual(self.store.last_incoming(CONNECTION["id"], SELLER), 0)
+
+    async def test_peer_flood_diagnosis_distinguishes_unknown_old_and_recent_incoming(self):
+        for index, (timestamp, key) in enumerate([(0, "incoming_unknown"),
+                                                  (self.now - 86400, "incoming_old"),
+                                                  (self.now - 10, "incoming_recent")]):
+            if timestamp:
+                incoming = self.message("hello", message_id=30 + index)
+                incoming["business_message"]["from"]["id"] = SELLER
+                incoming["business_message"]["date"] = timestamp
+                await self.service.handle(incoming)
+            self.api.failures["sendMessage"] = [TelegramError(400, "Bad Request: PEER_FLOOD")]
+            offer = await self.create_offer(message_id=40 + index)
+            notice = self.api.calls[-1][1]["text"]
+            self.assertEqual(offer["status"], "delivery_failed")
+            self.assertIn(TEXT["ru"][key], notice)
+            self.assertIn("не доказывает запрет на все сообщения", notice)
+
+    async def test_wire_peer_flood_sends_once_without_edit_fallback_or_command_deletion(self):
+        requests = []
+        self.service.api = Telegram(self.config.token)
+
+        def http(request, timeout):
+            method = request.full_url.rsplit("/", 1)[-1]
+            payload = json.loads(request.data)
+            requests.append((method, payload))
+            if method == "getBusinessConnection":
+                result = copy.deepcopy(CONNECTION)
+            elif method == "sendMessage" and "business_connection_id" in payload:
+                data = json.dumps({"ok": False, "error_code": 400,
+                                   "description": "Bad Request: PEER_FLOOD"}).encode()
+                raise HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(data))
+            elif method == "sendMessage" and payload["chat_id"] == BUYER:
+                result = {"message_id": 700}
+            else:
+                raise AssertionError(f"Unexpected retry or fallback method: {method}")
+            return io.BytesIO(json.dumps({"ok": True, "result": result}).encode())
+
+        with patch("gift_offer.telegram.urlopen", side_effect=http):
+            offer = await self.create_offer()
+            await self.service.handle(self.message())
+            self.now += 120
+            await self.service.tick()
+        self.assertEqual(offer["status"], "delivery_failed")
+        self.assertIsNone(offer["card_message_id"])
+        self.assertEqual(len(requests), 3)
+        self.assertEqual(sum(method == "sendMessage" and "business_connection_id" in p
+                             for method, p in requests), 1)
+        self.assertIn(TEXT["ru"]["incoming_unknown"], requests[-1][1]["text"])
+        self.assertIn("Ответ Telegram (400): <code>Bad Request: PEER_FLOOD</code>", requests[-1][1]["text"])
+
+    async def test_card_peer_flood_stops_entire_chat_batch_and_later_countdown_retries(self):
+        offers = [await self.create_offer(message_id=i) for i in (10, 11)]
+        self.api.failures["editMessageText"] = [TelegramError(400, "Bad Request: PEER_FLOOD")]
+        self.now += 60
+        await self.service.tick()
+        self.assertEqual(sum(method == "editMessageText" for method, _ in self.api.calls), 1)
+        self.assertIn(TEXT["ru"]["card_peer_flood"], self.api.calls[-1][1]["text"])
+        for delay in (60, 600, 86400):
+            self.now += delay
+            await self.service.tick()
+        self.assertEqual(sum(method == "editMessageText" for method, _ in self.api.calls), 1)
+        self.assertEqual(sum(method == "sendMessage" and "business_connection_id" in p
+                             for method, p in self.api.calls), 2)
+        self.assertTrue(all(self.store.offer(o["id"])["card_message_id"] for o in offers))
+
+    async def test_paused_card_callbacks_do_not_record_unperformed_actions(self):
+        offer = await self.create_offer()
+        self.store.pause_card_updates(offer["connection_id"], offer["chat_id"])
+        result = await self.act(offer, "accept", SELLER)
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(self.store.audit_stats().get("offer_accepted", 0), 0)
+        self.assertEqual(self.api.calls[-1][0], "answerCallbackQuery")
+        self.assertTrue(self.api.calls[-1][1]["show_alert"])
+        self.assertIn(TEXT["ru"]["card_updates_paused"], self.api.calls[-1][1]["text"])
+
+    async def test_peer_flood_pause_survives_restart_and_incoming_message(self):
+        await self.create_offer()
+        self.api.failures["editMessageText"] = [TelegramError(400, "PEER_FLOOD")]
+        self.now += 60
+        await self.service.tick()
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "offers.sqlite3")
+            snapshot = Store(path)
+            self.store.db.backup(snapshot.db)
+            snapshot.close()
+            restored = Store(path)
+            try:
+                api = FakeAPI()
+                service = Service(self.config, restored, api, BOT, clock=lambda: self.now)
+                self.now += 3600
+                await service.tick()
+                incoming = self.message("new incoming", message_id=50)
+                incoming["business_message"]["from"]["id"] = SELLER
+                await service.handle(incoming)
+                self.assertEqual(restored.last_incoming(CONNECTION["id"], SELLER), self.now)
+                self.assertFalse(restored.can_update_card(CONNECTION["id"], SELLER, self.now))
+                self.assertFalse(api.calls)
+                # Only an actual success of an explicitly requested new offer resumes edits.
+                await service.handle(self.message(message_id=51))
+                self.assertTrue(restored.can_update_card(CONNECTION["id"], SELLER, self.now))
+                self.assertEqual(restored.from_source(CONNECTION["id"], SELLER, 51)["status"], "pending")
+                self.assertEqual(sum(method == "sendMessage" and "business_connection_id" in p
+                                     for method, p in api.calls), 1)
+                self.assertTrue(any(method == "editMessageText" for method, _ in api.calls))
+            finally:
+                restored.close()
+
+    async def test_failed_or_ambiguous_new_offer_does_not_resume_card_updates(self):
+        await self.create_offer()
+        self.store.pause_card_updates(CONNECTION["id"], SELLER)
+        for index, error in enumerate([TelegramError(400, "PEER_FLOOD"), TransportError("offline")]):
+            self.api.failures["sendMessage"] = [error]
+            await self.create_offer(message_id=20 + index)
+            self.now += 120
+            await self.service.tick()
+            self.assertFalse(self.store.can_update_card(CONNECTION["id"], SELLER, self.now))
+            self.assertFalse(any(method == "editMessageText" for method, _ in self.api.calls))
+
+    async def test_send_peer_flood_pauses_existing_cards_but_does_not_block_other_chats(self):
+        await self.create_offer()
+        self.api.failures["sendMessage"] = [TelegramError(400, "PEER_FLOOD")]
+        await self.create_offer(message_id=11)
+        other = self.message(message_id=12)
+        other["business_message"]["chat"]["id"] = SELLER + 1
+        await self.service.handle(other)
+        self.now += 60
+        await self.service.tick()
+        edits = [p for method, p in self.api.calls if method == "editMessageText"]
+        self.assertEqual(len(edits), 1)
+        self.assertEqual(edits[0]["chat_id"], SELLER + 1)
+        self.assertFalse(self.store.can_update_card(CONNECTION["id"], SELLER, self.now))
+
+    async def test_card_rate_limit_waits_full_delay_for_all_cards_in_same_chat(self):
+        for message_id in (10, 11):
+            await self.create_offer(message_id=message_id)
+        self.api.failures["editMessageText"] = [TelegramError(429, "Too Many Requests", 120)]
+        self.now += 60
+        await self.service.tick()
+        self.now += 119
+        await self.service.tick()
+        self.assertEqual(sum(method == "editMessageText" for method, _ in self.api.calls), 1)
+        self.now += 1
+        await self.service.tick()
+        self.assertEqual(sum(method == "editMessageText" for method, _ in self.api.calls), 3)
+        self.assertTrue(all(o["dirty"] == 0 for o in self.store.db.execute("SELECT dirty FROM offers")))
+
+    async def test_card_rate_limit_persists_and_uses_time_of_final_refusal(self):
+        await self.create_offer()
+        self.api.failures["editMessageText"] = [TelegramError(429, "Too Many Requests", 120)]
+        original = self.api.call
+
+        async def delayed(method, **params):
+            if method == "editMessageText":
+                self.now += 30  # Simulate time spent waiting inside the transport.
+            return await original(method, **params)
+
+        self.now += 60
+        with patch.object(self.api, "call", side_effect=delayed):
+            await self.service.tick()
+        final_refusal_at = self.now
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "offers.sqlite3")
+            snapshot = Store(path)
+            self.store.db.backup(snapshot.db)
+            snapshot.close()
+            restored = Store(path)
+            try:
+                api = FakeAPI()
+                service = Service(self.config, restored, api, BOT, clock=lambda: self.now)
+                self.now = final_refusal_at + 119
+                await service.tick()
+                self.assertFalse(api.calls)
+                self.now += 1
+                await service.tick()
+                self.assertEqual(sum(method == "editMessageText" for method, _ in api.calls), 1)
+            finally:
+                restored.close()
+
+    async def test_paused_cards_do_not_starve_other_chats_at_batch_limit(self):
+        for message_id in range(100, 131):
+            await self.create_offer(message_id=message_id)
+        self.store.pause_card_updates(CONNECTION["id"], SELLER)
+        other = self.message(message_id=140)
+        other["business_message"]["chat"]["id"] = SELLER + 1
+        await self.service.handle(other)
+        self.now += 60
+        await self.service.tick()
+        edits = [p for method, p in self.api.calls if method == "editMessageText"]
+        self.assertEqual(len(edits), 1)
+        self.assertEqual(edits[0]["chat_id"], SELLER + 1)
+
     async def test_deleted_card_cannot_be_used(self):
         offer = await self.create_offer()
         await self.service.handle({"deleted_business_messages": {
@@ -1221,6 +1437,17 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 patch("gift_offer.telegram.asyncio.sleep", new=AsyncMock()) as sleep:
             self.assertTrue(await api.call("getBusinessConnection", business_connection_id=CONNECTION["id"]))
         sleep.assert_awaited_once_with(120)
+
+    async def test_explicit_peer_flood_takes_priority_over_emoji_and_retry_markers(self):
+        api = Telegram("123456:" + "X" * 30)
+        for code in (400, 429, 500):
+            with self.subTest(code=code), patch.object(
+                    api, "_call", side_effect=TelegramError(code, "PEER_FLOOD CUSTOM_EMOJI_NOT_ALLOWED", 60)) as request, \
+                    patch("gift_offer.telegram.asyncio.sleep", new=AsyncMock()) as sleep:
+                with self.assertRaises(TelegramError):
+                    await api.call("editMessageText", message_id=101, **self.decorated_params())
+                self.assertEqual(request.call_count, 1)
+                sleep.assert_not_awaited()
 
     async def test_bad_api_shapes_become_transport_errors_without_repeated_send(self):
         api = Telegram("123456:" + "X" * 30)

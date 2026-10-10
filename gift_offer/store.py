@@ -24,6 +24,13 @@ class Store:
             CREATE TABLE IF NOT EXISTS connections(
                 id TEXT PRIMARY KEY, payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS business_chat_state(
+                connection_id TEXT NOT NULL, chat_id INTEGER NOT NULL,
+                last_incoming_at INTEGER NOT NULL DEFAULT 0,
+                edits_paused INTEGER NOT NULL DEFAULT 0,
+                edit_retry_at INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(connection_id, chat_id)
+            );
             CREATE TABLE IF NOT EXISTS offers(
                 id TEXT PRIMARY KEY,
                 connection_id TEXT NOT NULL, chat_id INTEGER NOT NULL,
@@ -92,6 +99,44 @@ class Store:
             self.db.execute("INSERT OR REPLACE INTO connections VALUES(?,?)", (
                 connection["id"], json.dumps(connection, ensure_ascii=False),
             ))
+
+    def note_incoming(self, connection_id: str, chat_id: int, at: int) -> None:
+        # Only timestamps are stored, never private message contents.
+        with self.db:
+            self.db.execute("INSERT INTO business_chat_state(connection_id,chat_id,last_incoming_at) "
+                            "VALUES(?,?,?) ON CONFLICT(connection_id,chat_id) DO UPDATE SET "
+                            "last_incoming_at=MAX(last_incoming_at,excluded.last_incoming_at)",
+                            (connection_id, chat_id, at))
+
+    def last_incoming(self, connection_id: str, chat_id: int) -> int:
+        row = self.db.execute("SELECT last_incoming_at FROM business_chat_state "
+                              "WHERE connection_id=? AND chat_id=?", (connection_id, chat_id)).fetchone()
+        return row[0] if row else 0
+
+    def pause_card_updates(self, connection_id: str, chat_id: int) -> None:
+        with self.db:
+            self.db.execute("INSERT INTO business_chat_state(connection_id,chat_id,edits_paused) "
+                            "VALUES(?,?,1) ON CONFLICT(connection_id,chat_id) DO UPDATE SET edits_paused=1",
+                            (connection_id, chat_id))
+
+    def resume_card_updates(self, connection_id: str, chat_id: int) -> None:
+        # Resume only after an explicitly requested new offer actually succeeds.
+        # Incoming messages, elapsed time and restarts are not proof of recovery.
+        with self.db:
+            self.db.execute("UPDATE business_chat_state SET edits_paused=0 "
+                            "WHERE connection_id=? AND chat_id=?", (connection_id, chat_id))
+
+    def defer_card_updates(self, connection_id: str, chat_id: int, retry_at: int) -> None:
+        with self.db:
+            self.db.execute("INSERT INTO business_chat_state(connection_id,chat_id,edit_retry_at) "
+                            "VALUES(?,?,?) ON CONFLICT(connection_id,chat_id) DO UPDATE SET "
+                            "edit_retry_at=MAX(edit_retry_at,excluded.edit_retry_at)",
+                            (connection_id, chat_id, retry_at))
+
+    def can_update_card(self, connection_id: str, chat_id: int, now: int) -> bool:
+        row = self.db.execute("SELECT edits_paused,edit_retry_at FROM business_chat_state "
+                              "WHERE connection_id=? AND chat_id=?", (connection_id, chat_id)).fetchone()
+        return row is None or (not row[0] and row[1] <= now)
 
     def touch_user(self, user: dict, now: int) -> None:
         user_id = user.get("id")
@@ -328,9 +373,13 @@ class Store:
                             "AND card_message_id IS NOT NULL AND display_enabled=1", (now,))
             self.db.execute("INSERT OR REPLACE INTO settings VALUES('countdown_minute',?)", (minute,))
 
-    def dirty_offers(self) -> list[dict]:
+    def dirty_offers(self, now: int = 0) -> list[dict]:
         return [dict(row) for row in self.db.execute(
-            "SELECT * FROM offers WHERE dirty=1 AND card_message_id IS NOT NULL AND display_enabled=1 LIMIT 30"
+            "SELECT o.* FROM offers o LEFT JOIN business_chat_state s "
+            "ON s.connection_id=o.connection_id AND s.chat_id=o.chat_id "
+            "WHERE o.dirty=1 AND o.card_message_id IS NOT NULL AND o.display_enabled=1 "
+            "AND COALESCE(s.edits_paused,0)=0 AND COALESCE(s.edit_retry_at,0)<=? "
+            "ORDER BY o.updated_at,o.rowid LIMIT 30", (now,)
         )]
 
     def mark_clean(self, offer_id: str, displayed_status: str) -> None:
