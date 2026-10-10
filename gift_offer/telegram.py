@@ -41,6 +41,27 @@ class Telegram:
     def _redact(self, text: str) -> str:
         return text.replace(self._token, "[BOT_TOKEN]")[:500]
 
+    def _decode_response(self, data: bytes, http_code: int = 0):
+        try:
+            result = json.loads(data)
+        except ValueError:
+            raise TransportError("Telegram returned invalid JSON") from None
+        if not isinstance(result, dict) or type(result.get("ok")) is not bool:
+            raise TransportError("Telegram returned an invalid API response")
+        if result["ok"]:
+            if "result" not in result or http_code >= 400:
+                raise TransportError("Telegram returned an incomplete API response")
+            return result["result"]
+        code = result.get("error_code", http_code or 500)
+        description = result.get("description", "Unknown API error")
+        if type(code) is not int or not isinstance(description, str):
+            raise TransportError("Telegram returned an invalid error response")
+        parameters = result.get("parameters")
+        retry_after = parameters.get("retry_after", 0) if isinstance(parameters, dict) else 0
+        if type(retry_after) is not int or retry_after < 0:
+            retry_after = 0
+        raise TelegramError(code, self._redact(description), retry_after)
+
     def _call(self, method: str, params: dict, timeout: int):
         request = Request(
             f"https://api.telegram.org/bot{self._token}/{method}",
@@ -53,28 +74,14 @@ class Telegram:
                 data = response.read()
         except HTTPError as exc:
             try:
-                result = json.loads(exc.read())
-            except (ValueError, OSError):
-                raise TelegramError(exc.code, "HTTP error") from None
-            raise TelegramError(
-                result.get("error_code", exc.code),
-                self._redact(result.get("description", "HTTP error")),
-                int(result.get("parameters", {}).get("retry_after", 0)),
-            ) from None
+                data = exc.read()
+            except OSError:
+                raise TransportError("Telegram error response was interrupted") from None
+            return self._decode_response(data, exc.code)
         except (URLError, OSError, socket.timeout):
             # Never include a URL containing the token in logs or exceptions.
             raise TransportError("Telegram network request failed") from None
-        try:
-            result = json.loads(data)
-        except ValueError:
-            raise TransportError("Telegram returned invalid JSON") from None
-        if not result.get("ok"):
-            raise TelegramError(
-                int(result.get("error_code", 500)),
-                self._redact(result.get("description", "Unknown API error")),
-                int(result.get("parameters", {}).get("retry_after", 0)),
-            )
-        return result["result"]
+        return self._decode_response(data)
 
     async def call(self, method: str, **params):
         if method not in self.METHODS:
@@ -94,12 +101,13 @@ class Telegram:
                                 ("custom emoji", "tg-emoji", "button icon", "emoji id", "document invalid"))):
                     # A definitive rejection cannot have created a message. Retry
                     # once with ordinary emoji; never retry an ambiguous send.
+                    result = await self.call(method, **without_custom_emoji(params))
                     self._plain_emoji_scopes.add(emoji_scope)
                     log.info("Custom emoji unavailable in this message context; using standard icons.")
-                    return await self.call(method, **without_custom_emoji(params))
+                    return result
                 if exc.code == 429 and attempt < 2:
                     # A definitive rate-limit rejection is safe to retry.
-                    await asyncio.sleep(min(max(exc.retry_after, 1), 60))
+                    await asyncio.sleep(max(exc.retry_after, 1))
                     continue
                 if method in self.RETRY_SAFE and exc.code >= 500 and attempt < 2:
                     await asyncio.sleep(1 + attempt)

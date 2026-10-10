@@ -98,6 +98,16 @@ async def poll(service: Service, stop: asyncio.Event, health: dict):
                 break
             try:
                 await service.handle(update)
+            except (TelegramError, TransportError) as exc:
+                if isinstance(exc, TelegramError) and exc.code < 500 and exc.code != 429:
+                    # A rejected reply cannot succeed by replaying the same
+                    # update forever. Advance past it so other chats keep working.
+                    log.warning("Update %s reply was rejected: %s", update.get("update_id"), exc)
+                    service.store.set_setting("offset", str(update["update_id"] + 1))
+                    continue
+                log.warning("Update %s deferred while Telegram is unavailable: %s", update.get("update_id"), exc)
+                await wait_or_stop(stop, max(getattr(exc, "retry_after", 0), 5))
+                break
             except Exception:
                 # Preserve the offset on an unexpected processing failure.
                 # Offer source uniqueness prevents duplicate creation on redelivery.

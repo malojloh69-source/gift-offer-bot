@@ -30,15 +30,23 @@ class Service:
         self.lock = asyncio.Lock()
         # Refresh connections on first use after every restart, rather than trusting old rights.
         self.connections: dict[str, dict] = {}
+        self.connection_checked_at: dict[str, int] = {}
         self.retry_at: dict[str, int] = {}
         self.delete_notices: set[str] = set()
 
     async def connection(self, connection_id: str) -> dict:
-        if connection_id not in self.connections:
+        now = int(self.clock())
+        if connection_id not in self.connections or now - self.connection_checked_at.get(connection_id, 0) >= 60:
             connection = await self.api.call("getBusinessConnection", business_connection_id=connection_id)
+            user = connection.get("user") if isinstance(connection, dict) else None
+            if (not isinstance(user, dict) or connection.get("id") != connection_id
+                    or type(user.get("id")) is not int or user["id"] <= 0
+                    or type(connection.get("user_chat_id")) is not int or connection["user_chat_id"] <= 0):
+                raise TransportError("Telegram returned an incomplete business connection")
             self.connections[connection_id] = connection
+            self.connection_checked_at[connection_id] = now
             self.store.save_connection(connection)
-            self.store.touch_user(connection["user"], int(self.clock()))
+            self.store.touch_user(connection["user"], now)
         return self.connections[connection_id]
 
     async def answer(self, query_id: str, text: str, alert: bool = False) -> None:
@@ -65,6 +73,7 @@ class Service:
             if "business_connection" in update:
                 connection = update["business_connection"]
                 self.connections[connection["id"]] = connection
+                self.connection_checked_at[connection["id"]] = now
                 self.delete_notices.discard(connection["id"])
                 self.store.save_connection(connection)
                 self.store.touch_user(connection["user"], now)
@@ -80,6 +89,7 @@ class Service:
                 await self.private_message(update["message"], now)
             # Edited commands intentionally do not alter an existing contract.
             await self._flush(now)
+            await self._cleanup_commands(now)
 
     async def private_message(self, message: dict, now: int) -> None:
         if message.get("chat", {}).get("type") != "private" or message.get("from", {}).get("is_bot"):
@@ -143,6 +153,8 @@ class Service:
             connection = await self.connection(connection_id)
         except (TelegramError, TransportError) as exc:
             log.warning("Connection lookup failed: %s", exc)
+            if isinstance(exc, TransportError) or exc.code == 429 or exc.code >= 500:
+                raise
             return
         owner_id = connection["user"]["id"]
         self.store.touch_user(connection["user"], now)
@@ -178,6 +190,9 @@ class Service:
         offer = self.store.create(spec, connection, message, now, self.config.offer_ttl)
         try:
             result = await self.api.call("sendMessage", **card_payload(offer, self.config.name))
+            message_id = result.get("message_id") if isinstance(result, dict) else None
+            if type(message_id) is not int or message_id <= 0:
+                raise TransportError("Telegram did not return a delivered message identifier")
         except (TelegramError, TransportError) as exc:
             ambiguous = isinstance(exc, TransportError) or exc.code >= 500
             self.store.delivery_problem(offer["id"], ambiguous, now)
@@ -191,26 +206,51 @@ class Service:
                     spec.language, "delivery_cause", code=exc.code, cause=cause)
             await self.notify_owner(connection, response)
             return
-        self.store.attach_card(offer["id"], result["message_id"])
-        await self.delete_creation_command(connection, message, spec.language)
+        self.store.attach_card(offer["id"], message_id)
 
-    async def delete_creation_command(self, connection: dict, message: dict, language: str) -> None:
-        # A user's .buy was not sent by the bot: can_delete_sent_messages
-        # alone is insufficient. Delete exactly this command, after delivery.
-        if not connection.get("rights", {}).get("can_delete_all_messages"):
-            if connection["id"] not in self.delete_notices:
-                self.delete_notices.add(connection["id"])
-                await self.notify_owner(connection, tr(language, "delete_permission"))
-            return
-        try:
-            await self.api.call("deleteBusinessMessages", business_connection_id=connection["id"],
-                                message_ids=[message["message_id"]])
-        except (TelegramError, TransportError) as exc:
-            # The offer is already delivered. Keep it usable and do not resend.
-            log.warning("Creation command could not be deleted: %s", exc)
-            if connection["id"] not in self.delete_notices:
-                self.delete_notices.add(connection["id"])
-                await self.notify_owner(connection, tr(language, "delete_permission"))
+    async def _cleanup_commands(self, now: int) -> None:
+        # Jobs exist only for new commands. A confirmed card is required;
+        # failed sends are never retried or cleaned up by this queue.
+        for offer in self.store.command_cleanups(now):
+            if now - offer["sent_at"] >= 48 * 3600:
+                self.store.finish_command_cleanup(offer["id"])
+                continue
+            try:
+                connection = await self.connection(offer["connection_id"])
+                if not connection.get("is_enabled") or connection["user"]["id"] != offer["buyer_id"]:
+                    self.store.defer_command_cleanup(offer["id"], now + 60)
+                    continue
+                # The owner sent .buy, so deleting just the bot's own messages
+                # is insufficient. Keep the job until rights are refreshed.
+                if not connection.get("rights", {}).get("can_delete_all_messages"):
+                    self.store.defer_command_cleanup(offer["id"], now + 60)
+                    if connection["id"] not in self.delete_notices:
+                        self.delete_notices.add(connection["id"])
+                        await self.notify_owner(connection, tr(offer["language"], "delete_permission"))
+                    continue
+                deleted = await self.api.call("deleteBusinessMessages", business_connection_id=connection["id"],
+                                              message_ids=[offer["source_message_id"]])
+                if deleted is not True:
+                    raise TransportError("Telegram did not confirm command deletion")
+            except TelegramError as exc:
+                description = exc.description.lower()
+                if "message to delete not found" in description:
+                    self.store.finish_command_cleanup(offer["id"])
+                elif exc.code == 429 or exc.code >= 500:
+                    self.store.defer_command_cleanup(offer["id"], now + max(exc.retry_after, 30))
+                    log.info("Command deletion deferred after a temporary Telegram error.")
+                elif exc.code == 403:
+                    self.connections.pop(offer["connection_id"], None)
+                    self.store.defer_command_cleanup(offer["id"], now + 60)
+                else:
+                    self.store.finish_command_cleanup(offer["id"])
+                    log.warning("Creation command could not be deleted: %s", exc)
+                continue
+            except TransportError:
+                self.store.defer_command_cleanup(offer["id"], now + 30)
+                log.info("Command deletion deferred while Telegram is unreachable.")
+                continue
+            self.store.finish_command_cleanup(offer["id"])
 
     async def owner_command(self, connection: dict, message: dict, command: str, now: int) -> None:
         parts = message["text"].strip().split()
@@ -261,7 +301,9 @@ class Service:
             return
         try:
             connection = await self.connection(offer["connection_id"])
-        except (TelegramError, TransportError):
+        except (TelegramError, TransportError) as exc:
+            if isinstance(exc, TransportError) or exc.code == 429 or exc.code >= 500:
+                raise
             await self.answer(query_id, tr(language, "connection_disabled"), True)
             return
         if not can_reply(connection) or connection["user"]["id"] != offer["buyer_id"]:
@@ -291,6 +333,7 @@ class Service:
             now = int(self.clock())
             self.store.expire(now)
             await self._flush(now)
+            await self._cleanup_commands(now)
 
     async def _flush(self, now: int) -> None:
         for offer in self.store.dirty_offers():

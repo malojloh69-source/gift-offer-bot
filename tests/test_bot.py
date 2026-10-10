@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import asyncio
 import http.client
+import io
 import json
 import os
 import socket
@@ -12,6 +13,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from urllib.error import HTTPError
 
 from bot import connect_to_telegram, ensure_polling, health_server, poll, run
 from gift_offer.config import Config, load_dotenv
@@ -248,6 +250,147 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(offer["status"], "accepted")
         self.assertEqual(sum(method == "sendMessage" and "business_connection_id" in params
                              for method, params in self.api.calls), 1)
+
+    async def test_temporary_command_deletion_recovers_without_resending_card(self):
+        self.api.failures["deleteBusinessMessages"] = [TransportError("offline")]
+        offer = await self.create_offer()
+        self.now += 31
+        await self.service.tick()
+        self.assertEqual(sum(method == "deleteBusinessMessages" for method, _ in self.api.calls), 2)
+        self.assertEqual(sum(method == "sendMessage" and "business_connection_id" in params
+                             for method, params in self.api.calls), 1)
+        self.assertEqual(self.store.offer(offer["id"])["status"], "pending")
+
+    async def test_connection_rights_refresh_before_another_creation(self):
+        self.api.connection["rights"] = {"can_reply": True}
+        await self.create_offer()
+        self.api.connection["rights"]["can_delete_all_messages"] = True
+        self.now += 61
+        await self.create_offer(message_id=11)
+        self.assertTrue(any(method == "deleteBusinessMessages" and params["message_ids"] == [11]
+                            for method, params in self.api.calls))
+
+    async def test_connection_lookup_failure_preserves_update_for_poll_retry(self):
+        self.api.failures["getBusinessConnection"] = [TransportError("offline")]
+        with self.assertRaises(TransportError):
+            await self.service.handle(self.message())
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM offers").fetchone()[0], 0)
+        await self.service.handle(self.message())
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM offers").fetchone()[0], 1)
+
+    async def test_incomplete_connection_is_not_cached_or_used_to_create_an_offer(self):
+        self.api.connection = {"id": CONNECTION["id"], "is_enabled": True}
+        with self.assertRaises(TransportError):
+            await self.service.handle(self.message())
+        self.assertNotIn(CONNECTION["id"], self.service.connections)
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM offers").fetchone()[0], 0)
+
+    async def test_zero_message_id_does_not_delete_source_or_claim_delivery(self):
+        self.api.counter = -1
+        offer = await self.create_offer()
+        self.assertEqual(offer["status"], "delivery_unknown")
+        self.assertIsNone(offer["card_message_id"])
+        self.assertFalse(any(method == "deleteBusinessMessages" for method, _ in self.api.calls))
+
+    async def test_command_cleanup_survives_restart_without_resending_offer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "offers.sqlite3")
+            store = Store(path)
+            api = FakeAPI()
+            api.failures["deleteBusinessMessages"] = [TransportError("offline")]
+            service = Service(self.config, store, api, BOT, clock=lambda: self.now)
+            await service.handle(self.message())
+            offer = store.from_source(CONNECTION["id"], SELLER, 10)
+            store.close()
+            self.now += 31
+            reopened = Store(path)
+            try:
+                restarted = Service(self.config, reopened, api, BOT, clock=lambda: self.now)
+                await restarted.tick()
+                self.assertEqual(sum(method == "deleteBusinessMessages" for method, _ in api.calls), 2)
+                self.assertEqual(sum(method == "sendMessage" and "business_connection_id" in params
+                                     for method, params in api.calls), 1)
+                self.assertEqual(reopened.offer(offer["id"])["card_message_id"], offer["card_message_id"])
+                self.assertEqual(reopened.command_cleanups(self.now), [])
+            finally:
+                reopened.close()
+
+    async def test_already_deleted_command_completes_cleanup_without_repeated_requests(self):
+        self.api.failures["deleteBusinessMessages"] = [TelegramError(400, "message to delete not found")]
+        await self.create_offer()
+        self.now += 120
+        await self.service.tick()
+        self.assertEqual(sum(method == "deleteBusinessMessages" for method, _ in self.api.calls), 1)
+        self.assertEqual(self.store.command_cleanups(self.now), [])
+
+    async def test_old_source_command_is_not_deleted_after_telegram_time_limit(self):
+        update = self.message()
+        update["business_message"]["date"] = self.now - 48 * 3600
+        await self.service.handle(update)
+        self.assertFalse(any(method == "deleteBusinessMessages" for method, _ in self.api.calls))
+        self.assertEqual(self.store.command_cleanups(self.now), [])
+
+    async def test_unknown_delivery_is_cleaned_up_only_after_real_callback_recovery(self):
+        self.api.failures["sendMessage"] = [TransportError("offline")]
+        offer = await self.create_offer()
+        await self.service.tick()
+        self.assertFalse(any(method == "deleteBusinessMessages" for method, _ in self.api.calls))
+        await self.act(offer, "accept", SELLER)
+        deletions = [params for method, params in self.api.calls if method == "deleteBusinessMessages"]
+        self.assertEqual(deletions, [{"business_connection_id": CONNECTION["id"], "message_ids": [10]}])
+
+    async def test_telegram_wire_flow_creates_deletes_updates_and_opens_admin(self):
+        api = Telegram(self.config.token)
+        self.service.api = api
+        requests = []
+        accepted_cards = []
+        state = {"message_id": 100}
+
+        def http(request, timeout):
+            method = request.full_url.rsplit("/", 1)[-1]
+            payload = json.loads(request.data)
+            requests.append((method, payload))
+            if method == "getBusinessConnection":
+                result = copy.deepcopy(CONNECTION)
+            elif method == "sendMessage":
+                if "business_connection_id" in payload and has_custom_emoji(payload):
+                    error = json.dumps({"ok": False, "error_code": 400,
+                                        "description": "Bad Request: CUSTOM_EMOJI_NOT_ALLOWED"}).encode()
+                    raise HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(error))
+                state["message_id"] += 1
+                result = {"message_id": state["message_id"]}
+                if "business_connection_id" in payload:
+                    accepted_cards.append(payload)
+            elif method == "editMessageText":
+                result = {"message_id": payload["message_id"]}
+            elif method in {"deleteBusinessMessages", "answerCallbackQuery"}:
+                result = True
+            else:
+                raise AssertionError(f"Unexpected method: {method}")
+            return io.BytesIO(json.dumps({"ok": True, "result": result}, ensure_ascii=False).encode())
+
+        with patch("gift_offer.telegram.urlopen", side_effect=http):
+            offer = await self.create_offer()
+            for action, actor in [("accept", SELLER), ("settled", SELLER),
+                                  ("sent", SELLER), ("received", BUYER)]:
+                offer = await self.act(offer, action, actor)
+            self.assertEqual(offer["status"], "completed")
+            gram = await self.create_offer(".buy https://t.me/nft/DurovsCap-1234 10 gram en", message_id=11)
+            gram = await self.act(gram, "reject", SELLER)
+            self.assertEqual(gram["status"], "rejected")
+            await self.service.handle(self.private("/start"))
+            await self.service.handle(self.private("/ClezzyKryt", message_id=51))
+        self.assertEqual(len(accepted_cards), 2)
+        self.assertIn("⭐", accepted_cards[0]["text"])
+        self.assertIn("💎", accepted_cards[1]["text"])
+        self.assertEqual([params["message_ids"] for method, params in requests if method == "deleteBusinessMessages"],
+                         [[10], [11]])
+        edits = [params for method, params in requests if method == "editMessageText"]
+        self.assertTrue(edits)
+        self.assertTrue(all(not has_custom_emoji(params) for params in edits))
+        self.assertTrue(self.store.is_admin(BUYER))
+        self.assertEqual(self.store.audit_stats()["visit"], 1)
+        self.assertEqual(len(self.store.audit_page("transfers")), 2)
 
     async def test_invalid_or_incoming_command_is_never_deleted(self):
         await self.service.handle(self.message(".buy broken"))
@@ -627,6 +770,24 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PersistenceTests(unittest.TestCase):
+    def test_upgrade_does_not_delete_historical_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "offers.sqlite3")
+            store = Store(path)
+            now = 1800000000
+            offer = store.create(parse_buy(".buy https://t.me/nft/Gift-1 500 stars"), CONNECTION,
+                                 {"message_id": 10, "chat": {"id": SELLER}}, now, 21600)
+            store.attach_card(offer["id"], 101)
+            with store.db:
+                store.db.execute("DROP TABLE command_cleanup")
+            store.close()
+            upgraded = Store(path)
+            try:
+                self.assertEqual(upgraded.command_cleanups(now), [])
+                self.assertEqual(upgraded.offer(offer["id"])["card_message_id"], 101)
+            finally:
+                upgraded.close()
+
     def test_restart_retains_offer_events_and_poll_offset(self):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "offers.sqlite3")
@@ -785,6 +946,54 @@ class HealthTests(unittest.TestCase):
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_permanent_reply_failure_does_not_block_another_update(self):
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        stop = asyncio.Event()
+        handled = []
+
+        async def api_call(method, **params):
+            if handled:
+                stop.set()  # Also keeps this regression test bounded if polling breaks.
+                return []
+            return [{"update_id": 11}, {"update_id": 12}]
+
+        async def handle(update):
+            handled.append(update["update_id"])
+            if update["update_id"] == 11:
+                raise TelegramError(403, "bot was blocked by the user")
+            stop.set()
+
+        service = SimpleNamespace(store=store, api=SimpleNamespace(call=api_call), handle=handle)
+        with patch("bot.wait_or_stop", new=AsyncMock()):
+            await poll(service, stop, {"ready": True, "last_poll": 0})
+        self.assertEqual(handled, [11, 12])
+        self.assertEqual(store.get_setting("offset"), "13")
+
+    async def test_temporary_processing_failure_keeps_offset_and_recovers(self):
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        stop = asyncio.Event()
+        offsets, handled = [], []
+
+        async def api_call(method, **params):
+            offsets.append(params["offset"])
+            self.assertLessEqual(len(offsets), 2)
+            return [{"update_id": 11}]
+
+        async def handle(update):
+            handled.append(update["update_id"])
+            if len(handled) == 1:
+                raise TransportError("offline")
+            stop.set()
+
+        service = SimpleNamespace(store=store, api=SimpleNamespace(call=api_call), handle=handle)
+        with patch("bot.wait_or_stop", new=AsyncMock()):
+            await poll(service, stop, {"ready": True, "last_poll": 0})
+        self.assertEqual(offsets, [0, 0])
+        self.assertEqual(handled, [11, 11])
+        self.assertEqual(store.get_setting("offset"), "12")
+
     async def test_hosting_starts_health_before_network_and_survives_temporary_failure(self):
         attempts = 0
         api = SimpleNamespace(call=AsyncMock())
@@ -867,6 +1076,22 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rate_limit_waits_for_the_full_server_delay(self):
+        api = Telegram("123456:" + "X" * 30)
+        with patch.object(api, "_call", side_effect=[TelegramError(429, "Too Many Requests", 120), True]), \
+                patch("gift_offer.telegram.asyncio.sleep", new=AsyncMock()) as sleep:
+            self.assertTrue(await api.call("getBusinessConnection", business_connection_id=CONNECTION["id"]))
+        sleep.assert_awaited_once_with(120)
+
+    async def test_bad_api_shapes_become_transport_errors_without_repeated_send(self):
+        api = Telegram("123456:" + "X" * 30)
+        for response in [b'[]', b'{"ok":true}', b'{"ok":"yes","result":{}}']:
+            with self.subTest(response=response), \
+                    patch("gift_offer.telegram.urlopen", return_value=io.BytesIO(response)) as http:
+                with self.assertRaises(TransportError):
+                    await api.call("sendMessage", chat_id=SELLER, text="Offer")
+                self.assertEqual(http.call_count, 1)
+
     def decorated_params(self):
         return {"business_connection_id": CONNECTION["id"], "chat_id": SELLER,
                 "parse_mode": "HTML", "text": f'500 <tg-emoji emoji-id="{STARS_EMOJI_ID}">⭐</tg-emoji>',
@@ -904,6 +1129,15 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             direct.pop("business_connection_id")
             direct["chat_id"] = BUYER
             await api.call("sendMessage", **direct)
+            self.assertTrue(has_custom_emoji(request.call_args.args[1]))
+
+    async def test_unsuccessful_plain_fallback_does_not_disable_custom_icons(self):
+        api = Telegram("123456:" + "X" * 30)
+        with patch.object(api, "_call", side_effect=[TelegramError(400, "CUSTOM_EMOJI_NOT_ALLOWED"),
+                                                   TelegramError(400, "PEER_FLOOD"), {"message_id": 101}]) as request:
+            with self.assertRaisesRegex(TelegramError, "PEER_FLOOD"):
+                await api.call("sendMessage", **self.decorated_params())
+            await api.call("sendMessage", **self.decorated_params())
             self.assertTrue(has_custom_emoji(request.call_args.args[1]))
 
     async def test_ambiguous_send_never_retries_with_different_icons(self):

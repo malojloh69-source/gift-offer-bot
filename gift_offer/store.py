@@ -40,6 +40,11 @@ class Store:
                 UNIQUE(connection_id, chat_id, source_message_id)
             );
             CREATE INDEX IF NOT EXISTS offers_expiry ON offers(status, expires_at);
+            CREATE TABLE IF NOT EXISTS command_cleanup(
+                offer_id TEXT PRIMARY KEY REFERENCES offers(id),
+                sent_at INTEGER NOT NULL, retry_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS command_cleanup_due ON command_cleanup(retry_at);
             CREATE TABLE IF NOT EXISTS events(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 offer_id TEXT NOT NULL REFERENCES offers(id),
@@ -232,6 +237,10 @@ class Store:
         placeholders = ",".join("?" for _ in row)
         with self.db:
             self.db.execute(f"INSERT INTO offers({columns}) VALUES({placeholders})", tuple(row.values()))
+            sent_at = message.get("date")
+            if type(sent_at) is not int or sent_at <= 0:
+                sent_at = now
+            self.db.execute("INSERT INTO command_cleanup(offer_id,sent_at) VALUES(?,?)", (row["id"], sent_at))
             event = self.db.execute("INSERT INTO events(offer_id,actor_id,action,at) VALUES(?,?,?,?)",
                                     (row["id"], user["id"], "create", now))
             self._offer_audit(row, "create", user["id"], now, event.lastrowid)
@@ -246,6 +255,22 @@ class Store:
         with self.db:
             self.db.execute("UPDATE offers SET status=?, updated_at=? WHERE id=?", (status, now, offer_id))
             self.db.execute("INSERT INTO events(offer_id,action,at) VALUES(?,?,?)", (offer_id, status, now))
+            if not ambiguous:
+                self.db.execute("DELETE FROM command_cleanup WHERE offer_id=?", (offer_id,))
+
+    def command_cleanups(self, now: int) -> list[dict]:
+        return [dict(row) for row in self.db.execute(
+            "SELECT o.*,c.sent_at FROM command_cleanup c JOIN offers o ON o.id=c.offer_id "
+            "WHERE c.retry_at<=? AND o.card_message_id>0 AND o.display_enabled=1 "
+            "ORDER BY c.retry_at,o.created_at LIMIT 5", (now,))]
+
+    def finish_command_cleanup(self, offer_id: str) -> None:
+        with self.db:
+            self.db.execute("DELETE FROM command_cleanup WHERE offer_id=?", (offer_id,))
+
+    def defer_command_cleanup(self, offer_id: str, retry_at: int) -> None:
+        with self.db:
+            self.db.execute("UPDATE command_cleanup SET retry_at=? WHERE offer_id=?", (retry_at, offer_id))
 
     def recover_interrupted_sends(self, now: int) -> None:
         with self.db:
@@ -300,3 +325,7 @@ class Store:
                             "status=CASE WHEN status IN ('pending','accepted') THEN 'cancelled' ELSE status END "
                             "WHERE connection_id=? AND chat_id=? AND card_message_id=?",
                             (now, connection_id, chat_id, message_id))
+            self.db.execute("DELETE FROM command_cleanup WHERE offer_id IN ("
+                            "SELECT id FROM offers WHERE connection_id=? AND chat_id=? "
+                            "AND (source_message_id=? OR card_message_id=?))",
+                            (connection_id, chat_id, message_id, message_id))
