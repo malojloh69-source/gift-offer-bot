@@ -31,6 +31,7 @@ class Service:
         # Refresh connections on first use after every restart, rather than trusting old rights.
         self.connections: dict[str, dict] = {}
         self.retry_at: dict[str, int] = {}
+        self.delete_notices: set[str] = set()
 
     async def connection(self, connection_id: str) -> dict:
         if connection_id not in self.connections:
@@ -64,6 +65,7 @@ class Service:
             if "business_connection" in update:
                 connection = update["business_connection"]
                 self.connections[connection["id"]] = connection
+                self.delete_notices.discard(connection["id"])
                 self.store.save_connection(connection)
                 self.store.touch_user(connection["user"], now)
             elif "callback_query" in update:
@@ -184,6 +186,25 @@ class Service:
             await self.notify_owner(connection, tr(spec.language, key))
             return
         self.store.attach_card(offer["id"], result["message_id"])
+        await self.delete_creation_command(connection, message, spec.language)
+
+    async def delete_creation_command(self, connection: dict, message: dict, language: str) -> None:
+        # A user's .buy was not sent by the bot: can_delete_sent_messages
+        # alone is insufficient. Delete exactly this command, after delivery.
+        if not connection.get("rights", {}).get("can_delete_all_messages"):
+            if connection["id"] not in self.delete_notices:
+                self.delete_notices.add(connection["id"])
+                await self.notify_owner(connection, tr(language, "delete_permission"))
+            return
+        try:
+            await self.api.call("deleteBusinessMessages", business_connection_id=connection["id"],
+                                message_ids=[message["message_id"]])
+        except (TelegramError, TransportError) as exc:
+            # The offer is already delivered. Keep it usable and do not resend.
+            log.warning("Creation command could not be deleted: %s", exc)
+            if connection["id"] not in self.delete_notices:
+                self.delete_notices.add(connection["id"])
+                await self.notify_owner(connection, tr(language, "delete_permission"))
 
     async def owner_command(self, connection: dict, message: dict, command: str, now: int) -> None:
         parts = message["text"].strip().split()

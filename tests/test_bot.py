@@ -21,13 +21,15 @@ from gift_offer.store import Store
 from gift_offer.telegram import Telegram, TelegramError, TransportError
 from gift_offer.views import TEXT, card_payload, help_text, keyboard, render_text
 from gift_offer import admin
+from gift_offer.ui import (GRAM_EMOJI_ID, NEGATIVE_EMOJI_ID, POSITIVE_EMOJI_ID,
+                           STARS_EMOJI_ID, has_custom_emoji, without_custom_emoji)
 
 
 BUYER, SELLER, BOT = 111, 222, 999
 CONNECTION = {
     "id": "business-1", "user": {"id": BUYER, "first_name": "Buyer", "username": "real_buyer"},
     "user_chat_id": BUYER, "date": 1800000000,
-    "rights": {"can_reply": True}, "is_enabled": True,
+    "rights": {"can_reply": True, "can_delete_all_messages": True}, "is_enabled": True,
 }
 
 
@@ -202,6 +204,68 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         cards = [params for method, params in self.api.calls if method == "sendMessage" and "business_connection_id" in params]
         self.assertEqual(len(cards), 1)
 
+    async def test_creation_deletes_only_command_after_card_has_been_delivered(self):
+        offer = await self.create_offer()
+        sends = [(index, params) for index, (method, params) in enumerate(self.api.calls)
+                 if method == "sendMessage" and "business_connection_id" in params]
+        deletes = [(index, params) for index, (method, params) in enumerate(self.api.calls)
+                   if method == "deleteBusinessMessages"]
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(len(deletes), 1)
+        self.assertGreater(deletes[0][0], sends[0][0])
+        self.assertEqual(deletes[0][1], {"business_connection_id": CONNECTION["id"], "message_ids": [10]})
+        self.assertNotEqual(offer["card_message_id"], 10)
+        await self.service.handle({"deleted_business_messages": {
+            "business_connection_id": CONNECTION["id"], "chat": {"id": SELLER}, "message_ids": [10],
+        }})
+        self.assertEqual(self.store.offer(offer["id"])["status"], "pending")
+        self.assertEqual(self.store.offer(offer["id"])["display_enabled"], 1)
+
+    async def test_source_remains_when_delivery_failed_or_is_ambiguous(self):
+        for message_id, failure in [(10, TelegramError(403, "Forbidden")), (11, TransportError("offline"))]:
+            self.api.failures["sendMessage"] = [failure]
+            offer = await self.create_offer(message_id=message_id)
+            self.assertIsNone(offer["card_message_id"])
+        self.assertFalse(any(method == "deleteBusinessMessages" for method, _ in self.api.calls))
+
+    async def test_only_sent_message_permission_cannot_delete_owner_command(self):
+        self.api.connection["rights"] = {"can_reply": True, "can_delete_sent_messages": True}
+        first = await self.create_offer()
+        second = await self.create_offer(message_id=11)
+        self.assertEqual(first["status"], "pending")
+        self.assertEqual(second["status"], "pending")
+        self.assertFalse(any(method == "deleteBusinessMessages" for method, _ in self.api.calls))
+        notices = [params for method, params in self.api.calls if method == "sendMessage" and params["chat_id"] == BUYER]
+        self.assertEqual(len(notices), 1)
+        self.assertIn("удаление сообщений", notices[0]["text"])
+
+    async def test_deleted_command_failure_does_not_duplicate_or_disable_offer(self):
+        self.api.failures["deleteBusinessMessages"] = [TelegramError(400, "message can't be deleted")]
+        offer = await self.create_offer()
+        self.assertEqual(offer["status"], "pending")
+        self.assertIsNotNone(offer["card_message_id"])
+        offer = await self.act(offer, "accept", SELLER)
+        self.assertEqual(offer["status"], "accepted")
+        self.assertEqual(sum(method == "sendMessage" and "business_connection_id" in params
+                             for method, params in self.api.calls), 1)
+
+    async def test_invalid_or_incoming_command_is_never_deleted(self):
+        await self.service.handle(self.message(".buy broken"))
+        incoming = self.message(message_id=11)
+        incoming["business_message"]["from"]["id"] = SELLER
+        await self.service.handle(incoming)
+        self.assertFalse(any(method == "deleteBusinessMessages" for method, _ in self.api.calls))
+
+    async def test_greeting_has_only_creation_instructions_without_last_offer_commands(self):
+        for language in TEXT:
+            text = help_text(self.config.name, language)
+            self.assertIn(".buy", text)
+            self.assertNotIn(".status", text)
+            self.assertNotIn(".cancel", text)
+        await self.service.handle(self.private("/start"))
+        self.assertNotIn("последнего оффера", self.api.calls[-1][1]["text"])
+        self.assertNotIn("Telegram отклонил", self.api.calls[-1][1]["text"])
+
     async def test_incoming_or_forwarded_command_is_ignored(self):
         for changed in [{"from": {"id": SELLER}}, {"forward_origin": {"type": "user"}},
                         {"sender_business_bot": {"id": BOT}}, {"chat": {"id": -55, "type": "supergroup"}}]:
@@ -277,6 +341,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         offer = await self.create_offer()
         self.assertEqual(offer["status"], "delivery_failed")
         self.assertIsNone(offer["card_message_id"])
+        self.assertNotIn("Telegram отклонил", self.api.calls[-1][1]["text"])
 
     async def test_failed_card_edit_preserves_state_and_retries(self):
         offer = await self.create_offer()
@@ -318,6 +383,9 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 for row in payload["reply_markup"]["inline_keyboard"]:
                     for button in row:
                         self.assertLessEqual(len(button.get("callback_data", "").encode()), 64)
+                        action = button.get("callback_data", "").rsplit(":", 1)[-1]
+                        expected_icon = NEGATIVE_EMOJI_ID if action in {"reject", "cancel"} else POSITIVE_EMOJI_ID
+                        self.assertEqual(button["icon_custom_emoji_id"], expected_icon)
                 self.assertIn(TEXT[language]["disclosure"], payload["text"])
             self.assertLessEqual(len(help_text(self.config.name, language)), 4096)
 
@@ -759,6 +827,65 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):
+    def decorated_params(self):
+        return {"business_connection_id": CONNECTION["id"], "chat_id": SELLER,
+                "parse_mode": "HTML", "text": f'500 <tg-emoji emoji-id="{STARS_EMOJI_ID}">⭐</tg-emoji>',
+                "reply_markup": {"inline_keyboard": [[
+                    {"text": "Отклонить", "callback_data": "g:test:reject", "icon_custom_emoji_id": NEGATIVE_EMOJI_ID},
+                    {"text": "Принять", "callback_data": "g:test:accept", "icon_custom_emoji_id": POSITIVE_EMOJI_ID},
+                ]]}}
+
+    async def test_custom_emoji_rejection_retries_plain_card_and_keeps_every_action(self):
+        api = Telegram("123456:" + "X" * 30)
+        params = self.decorated_params()
+        with patch.object(api, "_call", side_effect=[TelegramError(400, "CUSTOM_EMOJI_NOT_ALLOWED"),
+                                                   {"message_id": 101}, True]) as request:
+            result = await api.call("sendMessage", **params)
+            self.assertEqual(result["message_id"], 101)
+            self.assertEqual(request.call_count, 2)
+            first, plain = request.call_args_list[0].args[1], request.call_args_list[1].args[1]
+            self.assertTrue(has_custom_emoji(first))
+            self.assertFalse(has_custom_emoji(plain))
+            self.assertEqual(plain["text"], "500 ⭐")
+            self.assertEqual([button["callback_data"] for button in plain["reply_markup"]["inline_keyboard"][0]],
+                             ["g:test:reject", "g:test:accept"])
+            self.assertEqual(plain["reply_markup"]["inline_keyboard"][0][0]["text"], "❌ Отклонить")
+            self.assertEqual(plain["reply_markup"]["inline_keyboard"][0][1]["text"], "✅ Принять")
+            await api.call("editMessageText", message_id=101, **params)
+            self.assertFalse(has_custom_emoji(request.call_args.args[1]))
+            self.assertEqual(request.call_count, 3)
+        self.assertTrue(has_custom_emoji(params))
+
+    async def test_business_emoji_rejection_does_not_disable_direct_bot_icons(self):
+        api = Telegram("123456:" + "X" * 30)
+        with patch.object(api, "_call", side_effect=[TelegramError(400, "BUTTON_ICON_INVALID"), True, True]) as request:
+            await api.call("sendMessage", **self.decorated_params())
+            direct = self.decorated_params()
+            direct.pop("business_connection_id")
+            direct["chat_id"] = BUYER
+            await api.call("sendMessage", **direct)
+            self.assertTrue(has_custom_emoji(request.call_args.args[1]))
+
+    async def test_ambiguous_send_never_retries_with_different_icons(self):
+        api = Telegram("123456:" + "X" * 30)
+        with patch.object(api, "_call", side_effect=TransportError("offline")) as request:
+            with self.assertRaises(TransportError):
+                await api.call("sendMessage", **self.decorated_params())
+            self.assertEqual(request.call_count, 1)
+
+    async def test_unrelated_rejection_is_not_hidden_by_emoji_fallback(self):
+        api = Telegram("123456:" + "X" * 30)
+        with patch.object(api, "_call", side_effect=TelegramError(400, "BUTTON_USER_INVALID")) as request:
+            with self.assertRaises(TelegramError):
+                await api.call("sendMessage", **self.decorated_params())
+            self.assertEqual(request.call_count, 1)
+
+    async def test_business_command_deletion_is_available_without_chat_id(self):
+        api = Telegram("123456:" + "X" * 30)
+        with patch.object(api, "_call", return_value=True) as request:
+            await api.call("deleteBusinessMessages", business_connection_id=CONNECTION["id"], message_ids=[10])
+        request.assert_called_once_with("deleteBusinessMessages", {"business_connection_id": CONNECTION["id"], "message_ids": [10]}, 20)
+
     async def test_webhook_deletion_is_available_and_preserves_queue_parameter(self):
         api = Telegram("123456:" + "X" * 30)
         with patch.object(api, "_call", return_value=True) as request:
@@ -795,6 +922,17 @@ class AdminViewTests(unittest.TestCase):
         text, markup = admin.log_page("transfers", [self.audit_row(1)])
         self.assertIn("&lt;a href=", text)
         self.assertNotIn('<a href="https://evil.test">', text)
+
+    def test_price_emoji_ids_and_admin_navigation_keep_full_string_ids(self):
+        row = self.audit_row(1)
+        for currency, emoji_id in [("stars", STARS_EMOJI_ID), ("gram", GRAM_EMOJI_ID)]:
+            row.update(amount="500", currency=currency)
+            text = admin.entry(row)
+            self.assertIn(f'<tg-emoji emoji-id="{emoji_id}">', text)
+        for markup in (admin.navigation(), admin.log_page("all", [row])[1]):
+            for line in markup["inline_keyboard"]:
+                for button in line:
+                    self.assertEqual(button["icon_custom_emoji_id"], POSITIVE_EMOJI_ID)
         self.assertNotIn("fake<script>", text)
         self.assertIn(f'tg://user?id={SELLER}', text)
         self.assertIn("заявление участника", text)

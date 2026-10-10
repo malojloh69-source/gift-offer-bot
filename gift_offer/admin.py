@@ -5,6 +5,8 @@ import re
 from datetime import datetime, timedelta, timezone
 from html import escape
 
+from .ui import button, price_text
+
 
 PAGE_SIZE = 5
 MSK = timezone(timedelta(hours=3))
@@ -20,9 +22,9 @@ EVENT_NAMES = {
 
 def navigation() -> dict:
     return {"inline_keyboard": [
-        [{"text": "Посещения", "callback_data": "a:visits:0"}, {"text": "Передачи NFT", "callback_data": "a:transfers:0"}],
-        [{"text": "Офферы", "callback_data": "a:offers:0"}, {"text": "Все логи", "callback_data": "a:all:0"}],
-        [{"text": "Обновить", "callback_data": "a:home"}],
+        [button("Посещения", callback_data="a:visits:0"), button("Передачи NFT", callback_data="a:transfers:0")],
+        [button("Офферы", callback_data="a:offers:0"), button("Все логи", callback_data="a:all:0")],
+        [button("Обновить", callback_data="a:home")],
     ]}
 
 
@@ -64,7 +66,7 @@ def entry(row: dict) -> str:
     if row.get("gift_url"):
         lines.append(f'NFT: <a href="{escape(row["gift_url"], quote=True)}">{escape(row["gift_name"][:72])}</a>')
     if row.get("amount"):
-        lines.append(f'Цена оффера: {escape(row["amount"])} {escape(row["currency"])}')
+        lines.append(f'Цена оффера: {price_text(row["amount"], row["currency"])}')
     if row["evidence"] == "telegram_service":
         lines.append("Источник: служебное событие Telegram.")
     elif kind in {"transfer_claim", "receipt_claim", "payment_claim"}:
@@ -86,6 +88,6 @@ def log_page(category: str, rows: list[dict]) -> tuple[str, dict]:
     text = heading + ("\n\n".join(blocks) if blocks else "Событий пока нет.")
     buttons = []
     if used and len(rows) > len(used):
-        buttons.append({"text": "Старее", "callback_data": f'a:{category}:{used[-1]["id"]}'})
-    buttons.append({"text": "Самые новые", "callback_data": f"a:{category}:0"})
-    return text, {"inline_keyboard": [buttons, [{"text": "Админ-панель", "callback_data": "a:home"}]]}
+        buttons.append(button("Старее", callback_data=f'a:{category}:{used[-1]["id"]}'))
+    buttons.append(button("Самые новые", callback_data=f"a:{category}:0"))
+    return text, {"inline_keyboard": [buttons, [button("Админ-панель", callback_data="a:home")]]}

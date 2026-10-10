@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import socket
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+from .ui import has_custom_emoji, without_custom_emoji
+
+
+log = logging.getLogger(__name__)
 
 
 class TelegramError(RuntimeError):
@@ -24,11 +30,13 @@ class Telegram:
     METHODS = frozenset({
         "getMe", "getWebhookInfo", "deleteWebhook", "getUpdates", "getBusinessConnection",
         "sendMessage", "editMessageText", "answerCallbackQuery", "setMyCommands",
+        "deleteBusinessMessages",
     })
     RETRY_SAFE = frozenset(METHODS - {"sendMessage"})
 
     def __init__(self, token: str):
         self._token = token
+        self._plain_emoji_scopes: set[str] = set()
 
     def _redact(self, text: str) -> str:
         return text.replace(self._token, "[BOT_TOKEN]")[:500]
@@ -71,11 +79,24 @@ class Telegram:
     async def call(self, method: str, **params):
         if method not in self.METHODS:
             raise ValueError("This API method is not supported by Gift Offer.")
+        message_method = method in {"sendMessage", "editMessageText"}
+        emoji_scope = params.get("business_connection_id") or "bot"
+        if message_method and emoji_scope in self._plain_emoji_scopes:
+            params = without_custom_emoji(params)
         timeout = int(params.get("timeout", 0)) + 15 if method == "getUpdates" else 20
         for attempt in range(3):
             try:
                 return await asyncio.to_thread(self._call, method, params, timeout)
             except TelegramError as exc:
+                description = exc.description.lower().replace("_", " ")
+                if (message_method and exc.code in {400, 403} and has_custom_emoji(params)
+                        and any(marker in description for marker in
+                                ("custom emoji", "tg-emoji", "button icon", "emoji id", "document invalid"))):
+                    # A definitive rejection cannot have created a message. Retry
+                    # once with ordinary emoji; never retry an ambiguous send.
+                    self._plain_emoji_scopes.add(emoji_scope)
+                    log.info("Custom emoji unavailable in this message context; using standard icons.")
+                    return await self.call(method, **without_custom_emoji(params))
                 if exc.code == 429 and attempt < 2:
                     # A definitive rate-limit rejection is safe to retry.
                     await asyncio.sleep(min(max(exc.retry_after, 1), 60))

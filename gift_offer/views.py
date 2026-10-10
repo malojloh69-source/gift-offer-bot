@@ -3,27 +3,30 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from html import escape
 
+from .ui import button, price_text
+
 
 TEXT = {
     "ru": {
         "offer": "Предложение", "proposes": "{buyer} предлагает <b>{price}</b> за подарок {gift}.",
         "stars": "⭐ Stars", "gram": "Gram", "expires": "Действует до {deadline}.",
-        "disclosure": "Отдельный сервис офферов. Бот не принимает и не удерживает деньги. Запуски бота и действия с офферами сохраняются в журнале.",
-        "accept": "✓ Принять", "reject": "✕ Отклонить", "gift": "Показать подарок",
+        "disclosure": "Расчёт и передача — напрямую между участниками. Действия с офферами записываются в журнал.",
+        "accept": "Принять", "reject": "Отклонить", "gift": "Показать подарок",
         "buyer": "Профиль покупателя", "cancel": "Отменить оффер",
         "sent": "Я передал подарок", "received": "Я получил подарок", "settled": "Я получил оплату",
         "pending": "Ожидает решения продавца",
-        "accepted": "Предложение принято. Согласуйте расчёт с покупателем. Оплата не подтверждена; передача подарка не запускает автоматическую выплату.",
-        "payment_reported": "Продавец сообщил о получении оплаты. Бот не проверял платёж. Передача подарка ещё не подтверждена.",
-        "payment_note": "Продавец также сообщил о получении оплаты; бот не проверял платёж.",
-        "gift_reported": "Продавец сообщил о передаче подарка. Покупатель должен проверить получение в своём аккаунте и подтвердить его. Бот не проверил передачу.",
+        "accepted": "Предложение принято. Согласуйте оплату и передачу подарка с покупателем.",
+        "payment_reported": "Продавец сообщил о получении оплаты. Ожидается передача подарка.",
+        "payment_note": "Продавец также сообщил о получении оплаты.",
+        "gift_reported": "Продавец сообщил о передаче подарка. Покупатель должен проверить его получение и подтвердить.",
         "gift_received": "Покупатель сообщил о получении подарка. Продавец может подтвердить получение оплаты после проверки собственного счёта.",
-        "completed": "Участники сообщили о получении подарка и оплаты. Оффер закрыт по их заявлениям; бот не проверял транзакции.",
+        "completed": "Участники сообщили о получении подарка и оплаты. Оффер закрыт по их заявлениям.",
         "rejected": "Продавец отклонил предложение.", "cancelled": "Оффер отменён.",
         "expired": "Срок предложения истёк. Создайте новый оффер, если хотите продолжить.",
-        "delivery_failed": "Карточка не отправлена: Telegram отклонил запрос.",
+        "delivery_failed": "Не удалось отправить оффер. Проверь доступ бота к этому чату и право отвечать.",
+        "delete_permission": "Оффер создан. Включи удаление сообщений для бота в «Автоматизации чатов», чтобы команда .buy удалялась автоматически.",
         "delivery_unknown": "Статус отправки неизвестен. Если карточка появилась, нажмите её кнопку; не создавайте дубликат до проверки чата.",
-        "help": "<b>{name} · Как создать оффер</b>\n\nОтправь команду со своего подключённого бизнес-аккаунта в личный чат с владельцем подарка:\n\n<code>.buy ССЫЛКА_НА_НФТ ЦЕНА ВАЛЮТА ЯЗЫК</code>\n\n<b>Примеры:</b>\n<code>.buy https://t.me/nft/DurovsCap-1234 500 stars</code>\n<code>.buy https://t.me/nft/DurovsCap-1234 10 gram en</code>\n<code>.buy https://t.me/nft/CupidCharm-15484 8900 stars ru</code>\n\nВалюты: <code>stars / gram</code>\nЯзыки: <code>ru / en / zh / ar</code>\nЯзык можно не указывать.\n\n<code>.status</code> — статус последнего оффера в текущем чате.\n<code>.cancel</code> — отмена последнего оффера до заявления о передаче или оплате.\n\n{disclosure}",
+        "help": "<b>Как создать оффер</b>\n\nПодключи бота через «Автоматизацию чатов» в Telegram и отправь команду в личный чат с владельцем подарка:\n\n<code>.buy ССЫЛКА_НА_НФТ ЦЕНА ВАЛЮТА ЯЗЫК</code>\n\n<b>Примеры:</b>\n<code>.buy https://t.me/nft/DurovsCap-1234 500 stars</code>\n<code>.buy https://t.me/nft/DurovsCap-1234 10 gram en</code>\n\nВалюты: <code>stars / gram</code>\nЯзыки: <code>ru / en / zh / ar</code> — можно не указывать.\n\nПосле отправки оффера команда удаляется из чата, если разрешено удаление сообщений.\n\n{disclosure}",
         "terms": "<b>{name} · Условия</b>\n\nБот хранит офферы и заявления участников. Stars и Gram — обозначения цены предложения. Касса, резервирование, выплаты, гарантия, автоматическая передача NFT и возвраты не подключены.\n\nПринятие означает согласие с ценой предложения. Кнопки передачи, получения и оплаты фиксируют только заявления пользователей. Проверяйте подарок в аккаунте, а оплату на собственном счёте.\n\nЦвет кнопок, фон чата и превью ссылок оформляет приложение Telegram.",
         "syntax": "Формат: .buy https://t.me/nft/Название-1234 500 stars ru",
         "gift_url": "Нужна ссылка https://t.me/nft/Название-1234 без параметров и сторонних доменов.",
@@ -42,21 +45,22 @@ TEXT = {
     "en": {
         "offer": "Offer", "proposes": "{buyer} offers <b>{price}</b> for {gift}.",
         "stars": "⭐ Stars", "gram": "Gram", "expires": "Valid until {deadline}.",
-        "disclosure": "Independent offer service. The bot does not collect or hold funds. Bot starts and offer actions are recorded in a log.",
-        "accept": "✓ Accept", "reject": "✕ Decline", "gift": "Show gift", "buyer": "Buyer profile",
+        "disclosure": "Payment and gift transfer are arranged directly between participants. Offer actions are recorded in a log.",
+        "accept": "Accept", "reject": "Decline", "gift": "Show gift", "buyer": "Buyer profile",
         "cancel": "Cancel offer", "sent": "I sent the gift", "received": "I received the gift", "settled": "I received payment",
         "pending": "Waiting for the seller",
-        "accepted": "Offer accepted. Agree settlement with the buyer. Payment is unconfirmed; sending the gift does not trigger an automatic payout.",
-        "payment_reported": "The seller reported receiving payment. The bot did not verify payment. The gift transfer has not been confirmed yet.",
-        "payment_note": "The seller also reported receiving payment; the bot did not verify it.",
-        "gift_reported": "The seller reported sending the gift. The buyer must check their account before confirming receipt. The bot has not verified the transfer.",
+        "accepted": "Offer accepted. Arrange payment and gift transfer with the buyer.",
+        "payment_reported": "The seller reported receiving payment. Waiting for the gift transfer.",
+        "payment_note": "The seller also reported receiving payment.",
+        "gift_reported": "The seller reported sending the gift. The buyer should check their account before confirming receipt.",
         "gift_received": "The buyer reported receiving the gift. The seller may confirm payment after checking their own account.",
-        "completed": "The participants reported receiving the gift and payment. The offer is closed based on their statements; the bot did not verify transactions.",
+        "completed": "Participants reported receiving the gift and payment. The offer is closed based on their statements.",
         "rejected": "The seller declined the offer.", "cancelled": "Offer cancelled.",
         "expired": "This offer has expired. Create a new offer to continue.",
-        "delivery_failed": "Telegram rejected the message request; the card was not sent.",
+        "delivery_failed": "Could not send the offer. Check the bot’s chat access and permission to reply.",
+        "delete_permission": "Offer created. Enable message deletion for the bot in Chat Automation to remove .buy commands automatically.",
         "delivery_unknown": "Message delivery is uncertain. If the card appeared, use its button. Check the chat before creating a duplicate.",
-        "help": "<b>{name} · Create an offer</b>\n\nSend this command from your connected business account in a private chat with the gift owner:\n\n<code>.buy NFT_LINK PRICE CURRENCY LANGUAGE</code>\n\n<code>.buy https://t.me/nft/DurovsCap-1234 500 stars</code>\n<code>.buy https://t.me/nft/DurovsCap-1234 10 gram en</code>\n\nCurrencies: <code>stars / gram</code>\nLanguages: <code>ru / en / zh / ar</code> (optional)\n\n<code>.status</code> — latest offer status in this chat.\n<code>.cancel</code> — cancel the latest offer before a transfer or payment report.\n\n{disclosure}",
+        "help": "<b>Create an offer</b>\n\nConnect the bot through Telegram Chat Automation, then send this command in a private chat with the gift owner:\n\n<code>.buy NFT_LINK PRICE CURRENCY LANGUAGE</code>\n\n<code>.buy https://t.me/nft/DurovsCap-1234 500 stars</code>\n<code>.buy https://t.me/nft/DurovsCap-1234 10 gram en</code>\n\nCurrencies: <code>stars / gram</code>\nLanguages: <code>ru / en / zh / ar</code> (optional)\n\nAfter the offer is sent, the command is deleted if message deletion is permitted.\n\n{disclosure}",
         "terms": "<b>{name} · Terms</b>\n\nThe bot records offers and participant statements. Stars and Gram are price labels. Payment collection, escrow, payouts, guarantees, automatic NFT transfers and refunds are not connected.\n\nAcceptance agrees to the proposed price. Confirmation buttons record user statements only. Check gifts in your account and payments in your own balance.\n\nTelegram controls button colours, chat backgrounds and link previews.",
         "syntax": "Format: .buy https://t.me/nft/Name-1234 500 stars en",
         "gift_url": "Use https://t.me/nft/Name-1234 without query parameters or other domains.",
@@ -74,20 +78,21 @@ TEXT = {
     "zh": {
         "offer": "报价", "proposes": "{buyer} 愿以 <b>{price}</b> 购买 {gift}。",
         "stars": "⭐ Stars", "gram": "Gram", "expires": "有效期至 {deadline}。",
-        "disclosure": "独立报价服务。机器人不收取或托管资金。启动机器人和报价操作将记录在日志中。",
-        "accept": "✓ 接受", "reject": "✕ 拒绝", "gift": "查看礼物", "buyer": "买家资料",
+        "disclosure": "付款和礼物转移由双方直接协商。报价操作会记录在日志中。",
+        "accept": "接受", "reject": "拒绝", "gift": "查看礼物", "buyer": "买家资料",
         "cancel": "取消报价", "sent": "我已转移礼物", "received": "我已收到礼物", "settled": "我已收到付款",
         "pending": "等待卖家决定",
-        "accepted": "报价已接受。请与买家商定结算方式。付款尚未确认；转移礼物不会触发自动付款。",
-        "payment_reported": "卖家表示已收到付款。机器人未验证付款。礼物转移尚未确认。",
-        "payment_note": "卖家也表示已收到付款；机器人未验证付款。",
-        "gift_reported": "卖家表示已转移礼物。买家应先在自己的账户中核实，再确认收到。机器人未验证转移。",
+        "accepted": "报价已接受。请与买家协商付款和礼物转移。",
+        "payment_reported": "卖家表示已收到付款。等待礼物转移。",
+        "payment_note": "卖家也表示已收到付款。",
+        "gift_reported": "卖家表示已转移礼物。买家应先在自己的账户中核实，再确认收到。",
         "gift_received": "买家表示已收到礼物。卖家核查自己的账户后，可确认收到付款。",
-        "completed": "双方表示已收到礼物和付款。报价根据双方声明关闭；机器人未验证交易。",
+        "completed": "双方表示已收到礼物和付款。报价根据双方声明关闭。",
         "rejected": "卖家拒绝了报价。", "cancelled": "报价已取消。", "expired": "报价已过期。如需继续，请创建新报价。",
-        "delivery_failed": "Telegram 拒绝了发送请求，报价卡片未发送。",
+        "delivery_failed": "无法发送报价。请检查机器人访问此聊天和回复消息的权限。",
+        "delete_permission": "报价已创建。请在聊天自动化中允许机器人删除消息，以便自动删除 .buy 命令。",
         "delivery_unknown": "发送状态未知。如果卡片已出现，请使用卡片按钮。创建重复报价前请检查聊天。",
-        "help": "<b>{name} · 创建报价</b>\n\n从已连接的商务账户，在与礼物持有者的私聊中发送：\n\n<code>.buy 礼物链接 价格 币种 语言</code>\n\n<code>.buy https://t.me/nft/DurovsCap-1234 500 stars zh</code>\n<code>.buy https://t.me/nft/DurovsCap-1234 10 gram en</code>\n\n币种：<code>stars / gram</code>\n语言：<code>ru / en / zh / ar</code>（可省略）\n\n<code>.status</code>：查看当前聊天的最新报价状态。\n<code>.cancel</code>：在声明转移或收款前取消最新报价。\n\n{disclosure}",
+        "help": "<b>创建报价</b>\n\n通过 Telegram 聊天自动化连接机器人，然后在与礼物持有者的私聊中发送：\n\n<code>.buy 礼物链接 价格 币种 语言</code>\n\n<code>.buy https://t.me/nft/DurovsCap-1234 500 stars zh</code>\n<code>.buy https://t.me/nft/DurovsCap-1234 10 gram en</code>\n\n币种：<code>stars / gram</code>\n语言：<code>ru / en / zh / ar</code>（可省略）\n\n发送报价后，如有删除消息的权限，命令会从聊天中删除。\n\n{disclosure}",
         "terms": "<b>{name} · 使用说明</b>\n\n机器人仅记录报价和用户声明。Stars 和 Gram 是价格标签。未连接收款、资金托管、付款、担保、自动礼物转移或退款功能。\n\n接受代表同意报价。确认按钮仅记录用户声明。请在自己的账户中核实礼物和付款。\n\n按钮颜色、聊天背景和链接预览由 Telegram 应用决定。",
         "syntax": "格式：.buy https://t.me/nft/Name-1234 500 stars zh",
         "gift_url": "请使用 https://t.me/nft/Name-1234，不含其他域名或查询参数。",
@@ -103,20 +108,21 @@ TEXT = {
     "ar": {
         "offer": "عرض", "proposes": "يعرض {buyer} مبلغ <b>{price}</b> مقابل {gift}.",
         "stars": "⭐ Stars", "gram": "Gram", "expires": "صالح حتى {deadline}.",
-        "disclosure": "خدمة عروض مستقلة. لا يستلم البوت الأموال أو يحتجزها. يتم تسجيل تشغيل البوت وإجراءات العروض في سجل.",
-        "accept": "✓ قبول", "reject": "✕ رفض", "gift": "عرض الهدية", "buyer": "ملف المشتري",
+        "disclosure": "يتفق الطرفان مباشرة على الدفع ونقل الهدية. تُسجّل إجراءات العروض في السجل.",
+        "accept": "قبول", "reject": "رفض", "gift": "عرض الهدية", "buyer": "ملف المشتري",
         "cancel": "إلغاء العرض", "sent": "أرسلت الهدية", "received": "استلمت الهدية", "settled": "استلمت الدفع",
         "pending": "بانتظار قرار البائع",
-        "accepted": "تم قبول العرض. اتفق على التسوية مع المشتري. الدفع غير مؤكد؛ نقل الهدية لا يؤدي إلى دفعة تلقائية.",
-        "payment_reported": "أفاد البائع باستلام الدفع. لم يتحقق البوت من الدفع. لم يتم تأكيد نقل الهدية بعد.",
-        "payment_note": "أفاد البائع أيضاً باستلام الدفع؛ لم يتحقق البوت منه.",
-        "gift_reported": "أفاد البائع بإرسال الهدية. على المشتري التحقق منها في حسابه قبل تأكيد الاستلام. لم يتحقق البوت من النقل.",
-        "gift_received": "أفاد المشتري باستلام الهدية. يمكن للبائع تأكيد استلام الدفع بعد التحقق من حسابه.",
-        "completed": "أفاد الطرفان باستلام الهدية والدفع. أُغلق العرض بناءً على تصريحاتهما؛ لم يتحقق البوت من المعاملات.",
+        "accepted": "تم قبول العرض. اتفق مع المشتري على الدفع ونقل الهدية.",
+        "payment_reported": "أبلغ البائع عن استلام الدفع. بانتظار نقل الهدية.",
+        "payment_note": "أبلغ البائع أيضًا عن استلام الدفع.",
+        "gift_reported": "أبلغ البائع عن إرسال الهدية. على المشتري التحقق من حسابه قبل تأكيد الاستلام.",
+        "gift_received": "أبلغ المشتري عن استلام الهدية. يمكن للبائع تأكيد الدفع بعد التحقق من حسابه.",
+        "completed": "أبلغ الطرفان عن استلام الهدية والدفع. أُغلق العرض بناءً على إفاداتهما.",
         "rejected": "رفض البائع العرض.", "cancelled": "تم إلغاء العرض.", "expired": "انتهت صلاحية العرض. أنشئ عرضاً جديداً للمتابعة.",
-        "delivery_failed": "رفض Telegram طلب الإرسال؛ لم تُرسل البطاقة.",
+        "delivery_failed": "تعذّر إرسال العرض. تحقق من وصول البوت إلى المحادثة وصلاحية الرد.",
+        "delete_permission": "تم إنشاء العرض. فعّل حذف الرسائل للبوت في أتمتة المحادثات لحذف أوامر .buy تلقائيًا.",
         "delivery_unknown": "حالة الإرسال غير معروفة. إن ظهرت البطاقة، استخدم زرها. تحقق من المحادثة قبل إنشاء عرض مكرر.",
-        "help": "<b>{name} · إنشاء عرض</b>\n\nأرسل الأمر من حساب الأعمال المتصل في محادثة خاصة مع مالك الهدية:\n\n<code>.buy NFT_LINK PRICE CURRENCY LANGUAGE</code>\n\n<code>.buy https://t.me/nft/DurovsCap-1234 500 stars ar</code>\n<code>.buy https://t.me/nft/DurovsCap-1234 10 gram en</code>\n\nالعملات: <code>stars / gram</code>\nاللغات: <code>ru / en / zh / ar</code> (اختياري)\n\n<code>.status</code> — حالة آخر عرض في هذه المحادثة.\n<code>.cancel</code> — إلغاء آخر عرض قبل الإبلاغ عن النقل أو الدفع.\n\n{disclosure}",
+        "help": "<b>إنشاء عرض</b>\n\nاربط البوت عبر أتمتة محادثات Telegram، ثم أرسل الأمر في محادثة خاصة مع صاحب الهدية:\n\n<code>.buy NFT_LINK PRICE CURRENCY LANGUAGE</code>\n\n<code>.buy https://t.me/nft/DurovsCap-1234 500 stars ar</code>\n<code>.buy https://t.me/nft/DurovsCap-1234 10 gram en</code>\n\nالعملات: <code>stars / gram</code>\nاللغات: <code>ru / en / zh / ar</code> (اختيارية)\n\nبعد إرسال العرض، يُحذف الأمر إذا كان حذف الرسائل مسموحًا.\n\n{disclosure}",
         "terms": "<b>{name} · الشروط</b>\n\nيسجل البوت العروض وتصريحات المشاركين فقط. Stars وGram تسميات للسعر. تحصيل الأموال وحجزها والدفع والضمان والنقل التلقائي للهدايا والاسترداد غير متصلة.\n\nالقبول يعني الموافقة على السعر. أزرار التأكيد تسجل تصريحات المستخدمين فقط. تحقق من الهدية والدفع في حسابك.\n\nيتحكم تطبيق Telegram بألوان الأزرار والخلفية ومعاينات الروابط.",
         "syntax": "الصيغة: .buy https://t.me/nft/Name-1234 500 stars ar",
         "gift_url": "استخدم https://t.me/nft/Name-1234 دون معاملات أو نطاقات أخرى.",
@@ -149,7 +155,7 @@ def render_text(offer: dict, name: str) -> str:
     language = offer["language"]
     gift = f'<a href="{escape(offer["gift_url"], quote=True)}">{escape(offer["gift_name"])}</a>'
     buyer = f'<a href="tg://user?id={offer["buyer_id"]}">{escape(offer["buyer_name"])}</a>'
-    price = f'{escape(offer["amount"])} {tr(language, offer["currency"])}'
+    price = price_text(offer["amount"], offer["currency"])
     lines = [
         f'<b>{escape(name)} · {tr(language, "offer")}</b>',
         "",
@@ -168,14 +174,15 @@ def render_text(offer: dict, name: str) -> str:
 def keyboard(offer: dict) -> dict:
     language = offer["language"]
     def action(key: str) -> dict:
-        return {"text": tr(language, key), "callback_data": f'g:{offer["id"]}:{key}'}
-    gift_button = {"text": tr(language, "gift"), "url": offer["gift_url"]}
+        return button(tr(language, key), callback_data=f'g:{offer["id"]}:{key}',
+                      negative=key in {"reject", "cancel"})
+    gift_button = button(tr(language, "gift"), url=offer["gift_url"])
     rows: list[list[dict]] = []
     state = offer["status"]
     if state == "pending":
         rows.append([action("reject"), action("accept")])
     if state in {"accepted", "payment_reported"}:
-        rows.append([{"text": tr(language, "buyer"), "url": f'tg://user?id={offer["buyer_id"]}'}, gift_button])
+        rows.append([button(tr(language, "buyer"), url=f'tg://user?id={offer["buyer_id"]}'), gift_button])
         if not offer.get("payment_claimed"):
             rows.append([action("settled")])
         rows.append([action("sent")])
