@@ -182,8 +182,14 @@ class Service:
             ambiguous = isinstance(exc, TransportError) or exc.code >= 500
             self.store.delivery_problem(offer["id"], ambiguous, now)
             log.warning("Offer %s could not be delivered: %s", offer["id"], exc)
-            key = "check_chat" if ambiguous else "delivery_failed"
-            await self.notify_owner(connection, tr(spec.language, key))
+            if ambiguous:
+                response = tr(spec.language, "check_chat")
+            else:
+                key = "peer_flood" if "PEER_FLOOD" in exc.description.upper() else "delivery_failed"
+                cause = escape(exc.description.replace(self.config.token, "[BOT_TOKEN]")[:500])
+                response = tr(spec.language, key) + "\n\n" + tr(
+                    spec.language, "delivery_cause", code=exc.code, cause=cause)
+            await self.notify_owner(connection, response)
             return
         self.store.attach_card(offer["id"], result["message_id"])
         await self.delete_creation_command(connection, message, spec.language)

@@ -343,6 +343,46 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(offer["card_message_id"])
         self.assertNotIn("Telegram отклонил", self.api.calls[-1][1]["text"])
 
+    async def test_peer_flood_has_specific_diagnosis_keeps_command_and_never_resends(self):
+        self.api.failures["sendMessage"] = [TelegramError(400, "Bad Request: PEER_FLOOD")]
+        offer = await self.create_offer()
+        self.assertEqual(offer["status"], "delivery_failed")
+        self.assertIsNone(offer["card_message_id"])
+        notification = self.api.calls[-1][1]
+        self.assertEqual(notification["chat_id"], BUYER)
+        self.assertIn("PEER_FLOOD", notification["text"])
+        self.assertIn('href="https://t.me/SpamBot"', notification["text"])
+        self.assertIn("Ответ Telegram (400)", notification["text"])
+        self.assertNotIn("право отвечать", notification["text"])
+        await self.create_offer()
+        await self.service.tick()
+        self.assertFalse(any(method == "deleteBusinessMessages" for method, _ in self.api.calls))
+        self.assertEqual(sum(method == "sendMessage" and "business_connection_id" in params
+                             for method, params in self.api.calls), 1)
+
+    async def test_actual_delivery_reason_is_escaped_and_token_is_not_sent_to_owner(self):
+        description = 'Bad Request: <b>bad payload & field</b> ' + self.config.token
+        self.api.failures["sendMessage"] = [TelegramError(400, description)]
+        with self.assertLogs("gift_offer.service", level="WARNING"):
+            await self.create_offer()
+        text = self.api.calls[-1][1]["text"]
+        self.assertIn("Ответ Telegram (400)", text)
+        self.assertIn("&lt;b&gt;bad payload &amp; field&lt;/b&gt;", text)
+        self.assertNotIn("<b>bad payload", text)
+        self.assertNotIn(self.config.token, text)
+        self.assertNotIn("право отвечать", text)
+
+    async def test_peer_flood_notifications_follow_offer_language(self):
+        for index, language in enumerate(TEXT):
+            with self.subTest(language=language):
+                self.api.failures["sendMessage"] = [TelegramError(400, "Bad Request: PEER_FLOOD")]
+                await self.create_offer(f".buy https://t.me/nft/CupidCharm-15484 100 stars {language}",
+                                        message_id=30 + index)
+                text = self.api.calls[-1][1]["text"]
+                self.assertIn(TEXT[language]["peer_flood"], text)
+                self.assertIn("PEER_FLOOD", text)
+                self.assertLessEqual(len(text), 4096)
+
     async def test_failed_card_edit_preserves_state_and_retries(self):
         offer = await self.create_offer()
         self.api.failures["editMessageText"] = [TransportError("offline")]
@@ -879,6 +919,17 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(TelegramError):
                 await api.call("sendMessage", **self.decorated_params())
             self.assertEqual(request.call_count, 1)
+
+    async def test_peer_flood_is_never_retried_or_treated_as_an_emoji_restriction(self):
+        api = Telegram("123456:" + "X" * 30)
+        with patch.object(api, "_call", side_effect=[TelegramError(400, "Bad Request: PEER_FLOOD"),
+                                                   {"message_id": 101}]) as request:
+            with self.assertRaisesRegex(TelegramError, "PEER_FLOOD"):
+                await api.call("sendMessage", **self.decorated_params())
+            self.assertEqual(request.call_count, 1)
+            # A later user-requested send still uses the original icons.
+            await api.call("sendMessage", **self.decorated_params())
+            self.assertTrue(has_custom_emoji(request.call_args.args[1]))
 
     async def test_business_command_deletion_is_available_without_chat_id(self):
         api = Telegram("123456:" + "X" * 30)
