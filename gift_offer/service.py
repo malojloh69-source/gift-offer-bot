@@ -9,7 +9,7 @@ from html import escape
 
 from .config import Config
 from . import admin
-from .domain import OfferError, parse_buy
+from .domain import OfferError, next_status, parse_buy
 from .store import Store
 from .telegram import TelegramError, TransportError
 from .views import card_payload, help_text, language_for, render_text, tr
@@ -339,8 +339,22 @@ class Service:
         if message["message_id"] != offer["card_message_id"]:
             await self.answer(query_id, tr(language, "wrong_card"), True)
             return
-        if not self.store.can_update_card(offer["connection_id"], offer["chat_id"], now):
-            await self.answer(query_id, tr(language, "card_updates_paused"), True)
+        paused = not self.store.can_update_card(offer["connection_id"], offer["chat_id"], now)
+        repeated = False
+        try:
+            # Verify the action's role and state before attempting a manual refresh.
+            next_status(offer, action, user["id"], now)
+        except OfferError as exc:
+            if not paused or exc.code != "already_done":
+                await self.answer(query_id, tr(language, exc.code), True)
+                return
+            # A prior click may already be saved while its card edit was refused.
+            # Refresh that state without recording the action for a second time.
+            repeated = True
+        if paused and not await self.refresh_paused_card(offer, connection, query_id, now):
+            return
+        if repeated:
+            await self.answer(query_id, tr(language, "already_done"), True)
             return
         self.store.touch_user(user, now)
         try:
@@ -351,6 +365,42 @@ class Service:
             await self.answer(query_id, tr(language, exc.code), True)
             return
         await self.answer(query_id, tr(language, "done"))
+
+    async def refresh_paused_card(self, offer: dict, connection: dict, query_id: str, now: int) -> bool:
+        # Called only by a verified participant's button on this delivered card.
+        # Never turn a rejected creation command or an arbitrary message into a card.
+        wait = self.store.card_update_wait(offer["connection_id"], offer["chat_id"], now)
+        if wait:
+            await self.answer(query_id, tr(offer["language"], "card_wait", seconds=wait), True)
+            return False
+        try:
+            result = await self.api.call("editMessageText", message_id=offer["card_message_id"],
+                                         **card_payload(offer, self.config.name, now=now))
+            if (not isinstance(result, dict) or type(result.get("message_id")) is not int
+                    or result["message_id"] != offer["card_message_id"]):
+                raise TransportError("Telegram did not confirm the refreshed card identifier")
+        except TelegramError as exc:
+            if not (exc.code == 400 and "message is not modified" in exc.description.lower()
+                    and not exc.is_peer_flood):
+                if exc.code == 429:
+                    self.store.defer_card_updates(offer["connection_id"], offer["chat_id"],
+                                                  int(self.clock()) + max(exc.retry_after, 60))
+                self.store.pause_card_updates(offer["connection_id"], offer["chat_id"])
+                log.warning("Requested refresh of card %s was rejected: %s", offer["id"], exc)
+                await self.answer(query_id, tr(offer["language"], "card_updates_paused"), True)
+                cause = escape(exc.description.replace(self.config.token, "[BOT_TOKEN]")[:500])
+                response = tr(offer["language"], "card_refresh_failed") + "\n\n" + tr(
+                    offer["language"], "delivery_cause", code=exc.code, cause=cause)
+                await self.notify_owner(connection, response)
+                return False
+        except TransportError as exc:
+            log.warning("Requested refresh of card %s was not confirmed: %s", offer["id"], exc)
+            await self.answer(query_id, tr(offer["language"], "card_refresh_unknown"), True)
+            return False
+        self.store.mark_clean(offer["id"], offer["status"])
+        self.store.resume_card_updates(offer["connection_id"], offer["chat_id"])
+        self.retry_at.pop(offer["id"], None)
+        return True
 
     async def tick(self) -> None:
         async with self.lock:

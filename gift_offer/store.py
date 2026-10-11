@@ -120,7 +120,7 @@ class Store:
                             (connection_id, chat_id))
 
     def resume_card_updates(self, connection_id: str, chat_id: int) -> None:
-        # Resume only after an explicitly requested new offer actually succeeds.
+        # Resume only after an explicitly requested send or existing-card refresh succeeds.
         # Incoming messages, elapsed time and restarts are not proof of recovery.
         with self.db:
             self.db.execute("UPDATE business_chat_state SET edits_paused=0 "
@@ -137,6 +137,11 @@ class Store:
         row = self.db.execute("SELECT edits_paused,edit_retry_at FROM business_chat_state "
                               "WHERE connection_id=? AND chat_id=?", (connection_id, chat_id)).fetchone()
         return row is None or (not row[0] and row[1] <= now)
+
+    def card_update_wait(self, connection_id: str, chat_id: int, now: int) -> int:
+        row = self.db.execute("SELECT edit_retry_at FROM business_chat_state "
+                              "WHERE connection_id=? AND chat_id=?", (connection_id, chat_id)).fetchone()
+        return max(row[0] - now, 0) if row else 0
 
     def touch_user(self, user: dict, now: int) -> None:
         user_id = user.get("id")

@@ -51,6 +51,8 @@ class FakeAPI:
         if method == "sendMessage":
             self.counter += 1
             return {"message_id": self.counter}
+        if method == "editMessageText":
+            return {"message_id": params["message_id"]}
         return True
 
 
@@ -701,15 +703,155 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                              for method, p in self.api.calls), 2)
         self.assertTrue(all(self.store.offer(o["id"])["card_message_id"] for o in offers))
 
-    async def test_paused_card_callbacks_do_not_record_unperformed_actions(self):
+    async def test_paused_card_refusal_does_not_record_unperformed_actions(self):
         offer = await self.create_offer()
         self.store.pause_card_updates(offer["connection_id"], offer["chat_id"])
+        self.api.failures["editMessageText"] = [TelegramError(400, "PEER_FLOOD")]
         result = await self.act(offer, "accept", SELLER)
         self.assertEqual(result["status"], "pending")
         self.assertEqual(self.store.audit_stats().get("offer_accepted", 0), 0)
-        self.assertEqual(self.api.calls[-1][0], "answerCallbackQuery")
-        self.assertTrue(self.api.calls[-1][1]["show_alert"])
-        self.assertIn(TEXT["ru"]["card_updates_paused"], self.api.calls[-1][1]["text"])
+        answers = [p for method, p in self.api.calls if method == "answerCallbackQuery"]
+        self.assertTrue(answers[-1]["show_alert"])
+        self.assertIn(TEXT["ru"]["card_updates_paused"], answers[-1]["text"])
+        edits = [p for method, p in self.api.calls if method == "editMessageText"]
+        self.assertEqual(len(edits), 1)
+        self.assertEqual(edits[0]["message_id"], offer["card_message_id"])
+        self.assertIn("Ответ Telegram (400): <code>PEER_FLOOD</code>", self.api.calls[-1][1]["text"])
+
+    async def test_paused_card_recovers_on_valid_click_without_creating_another_offer(self):
+        offer = await self.create_offer()
+        self.store.pause_card_updates(offer["connection_id"], offer["chat_id"])
+        self.api.calls.clear()
+        result = await self.act(offer, "accept", SELLER)
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(result["dirty"], 0)
+        self.assertTrue(self.store.can_update_card(CONNECTION["id"], SELLER, self.now))
+        self.assertEqual(self.store.audit_stats()["offer_accepted"], 1)
+        edits = [p for method, p in self.api.calls if method == "editMessageText"]
+        self.assertEqual(len(edits), 2)
+        self.assertTrue(all(p["message_id"] == offer["card_message_id"] for p in edits))
+        self.assertFalse(any(method in {"sendMessage", "deleteBusinessMessages"} for method, _ in self.api.calls))
+
+    async def test_paused_card_with_saved_action_refreshes_without_duplicate_audit(self):
+        offer = await self.create_offer()
+        offer = await self.act(offer, "accept", SELLER)
+        self.store.pause_card_updates(offer["connection_id"], offer["chat_id"])
+        self.api.calls.clear()
+        result = await self.act(offer, "accept", SELLER)
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(self.store.audit_stats()["offer_accepted"], 1)
+        self.assertTrue(self.store.can_update_card(CONNECTION["id"], SELLER, self.now))
+        self.assertEqual(sum(method == "editMessageText" for method, _ in self.api.calls), 1)
+        self.assertEqual(self.api.calls[-1][1]["text"], TEXT["ru"]["already_done"])
+
+    async def test_paused_card_unchanged_response_is_an_idempotent_refresh(self):
+        offer = await self.create_offer()
+        self.store.pause_card_updates(offer["connection_id"], offer["chat_id"])
+        self.api.failures["editMessageText"] = [TelegramError(400, "message is not modified")]
+        result = await self.act(offer, "accept", SELLER)
+        self.assertEqual(result["status"], "accepted")
+        self.assertTrue(self.store.can_update_card(CONNECTION["id"], SELLER, self.now))
+        self.assertEqual(self.store.audit_stats()["offer_accepted"], 1)
+
+    async def test_paused_card_wrong_role_cannot_trigger_refresh(self):
+        offer = await self.create_offer()
+        self.store.pause_card_updates(offer["connection_id"], offer["chat_id"])
+        self.api.calls.clear()
+        result = await self.act(offer, "accept", BUYER)
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(self.api.calls[-1][1]["text"], TEXT["ru"]["wrong_role"])
+        self.assertFalse(any(method == "editMessageText" for method, _ in self.api.calls))
+        self.assertFalse(self.store.can_update_card(CONNECTION["id"], SELLER, self.now))
+
+    async def test_paused_card_respects_active_retry_after_before_any_edit(self):
+        offer = await self.create_offer()
+        self.store.pause_card_updates(offer["connection_id"], offer["chat_id"])
+        self.store.defer_card_updates(offer["connection_id"], offer["chat_id"], self.now + 120)
+        self.api.calls.clear()
+        result = await self.act(offer, "accept", SELLER)
+        self.assertEqual(result["status"], "pending")
+        self.assertFalse(any(method == "editMessageText" for method, _ in self.api.calls))
+        self.assertEqual(self.api.calls[-1][1]["text"], TEXT["ru"]["card_wait"].format(seconds=120))
+        self.now += 120
+        result = await self.act(offer, "accept", SELLER)
+        self.assertEqual(result["status"], "accepted")
+
+    async def test_paused_card_transport_failure_does_not_clear_pause_or_change_state(self):
+        offer = await self.create_offer()
+        self.store.pause_card_updates(offer["connection_id"], offer["chat_id"])
+        self.api.failures["editMessageText"] = [TransportError("offline")]
+        result = await self.act(offer, "accept", SELLER)
+        self.assertEqual(result["status"], "pending")
+        self.assertFalse(self.store.can_update_card(CONNECTION["id"], SELLER, self.now))
+        self.assertEqual(self.api.calls[-1][1]["text"], TEXT["ru"]["card_refresh_unknown"])
+        self.assertEqual(self.store.audit_stats().get("offer_accepted", 0), 0)
+
+    async def test_paused_card_invalid_success_identifier_does_not_clear_pause(self):
+        offer = await self.create_offer()
+        self.store.pause_card_updates(offer["connection_id"], offer["chat_id"])
+        original = self.api.call
+        for response in [True, None, {"message_id": str(offer["card_message_id"])},
+                         {"message_id": offer["card_message_id"] + 1}]:
+            async def invalid(method, **params):
+                if method == "editMessageText":
+                    return response
+                return await original(method, **params)
+            with self.subTest(response=response), patch.object(self.api, "call", side_effect=invalid):
+                result = await self.act(offer, "accept", SELLER)
+            self.assertEqual(result["status"], "pending")
+            self.assertFalse(self.store.can_update_card(CONNECTION["id"], SELLER, self.now))
+        self.assertEqual(self.store.audit_stats().get("offer_accepted", 0), 0)
+
+    async def test_paused_card_recovers_after_restart_on_its_existing_button(self):
+        offer = await self.create_offer()
+        self.store.pause_card_updates(offer["connection_id"], offer["chat_id"])
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "offers.sqlite3")
+            snapshot = Store(path)
+            self.store.db.backup(snapshot.db)
+            snapshot.close()
+            restored = Store(path)
+            try:
+                api = FakeAPI()
+                service = Service(self.config, restored, api, BOT, clock=lambda: self.now)
+                await service.handle(self.callback(offer, "accept", SELLER))
+                self.assertEqual(restored.offer(offer["id"])["status"], "accepted")
+                self.assertTrue(restored.can_update_card(CONNECTION["id"], SELLER, self.now))
+                self.assertEqual(restored.audit_stats()["offer_accepted"], 1)
+                self.assertFalse(any(method == "sendMessage" for method, _ in api.calls))
+            finally:
+                restored.close()
+
+    async def test_wire_paused_card_restores_accept_and_confirmation_without_resending(self):
+        offer = await self.create_offer()
+        self.store.pause_card_updates(offer["connection_id"], offer["chat_id"])
+        self.service.api = Telegram(self.config.token)
+        requests = []
+
+        def http(request, timeout):
+            method = request.full_url.rsplit("/", 1)[-1]
+            payload = json.loads(request.data)
+            requests.append((method, payload))
+            if method == "editMessageText":
+                self.assertEqual(payload["business_connection_id"], CONNECTION["id"])
+                self.assertEqual(payload["chat_id"], SELLER)
+                self.assertEqual(payload["message_id"], offer["card_message_id"])
+                result = {"message_id": payload["message_id"]}
+            elif method == "answerCallbackQuery":
+                result = True
+            else:
+                raise AssertionError(f"Unexpected send or method during recovery: {method}")
+            return io.BytesIO(json.dumps({"ok": True, "result": result}).encode())
+
+        with patch("gift_offer.telegram.urlopen", side_effect=http):
+            offer = await self.act(offer, "accept", SELLER)
+            self.assertEqual(offer["status"], "accepted")
+            offer = await self.act(offer, "confirm_transfer", SELLER)
+        self.assertEqual(offer["status"], "transfer_confirmed")
+        self.assertEqual(offer["payment_claimed"], 0)
+        self.assertEqual(sum(method == "editMessageText" for method, _ in requests), 3)
+        self.assertEqual(self.store.audit_stats()["offer_accepted"], 1)
+        self.assertEqual(len(self.store.audit_page("transfers")), 1)
 
     async def test_peer_flood_pause_survives_restart_and_incoming_message(self):
         await self.create_offer()
